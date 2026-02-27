@@ -19,7 +19,6 @@ import torch
 from torch._inductor.ir import (
     ComputedBuffer,
     FallbackKernel,
-    FixedLayout,
     MultiOutput,
     Pointwise,
     Reduction,
@@ -65,10 +64,7 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     if host_dim_idx != layout.device_layout.host_stick_dim():
         return int(layout.size[host_dim_idx])
     else:  # stick dim: parallelizable unit is number of sticks
-        return (
-            int(layout.size[host_dim_idx])
-            // layout.device_layout.elems_per_stick()
-        )
+        return int(layout.size[host_dim_idx]) // layout.device_layout.elems_per_stick()
 
 
 def core_split(size: int, max_cores: int) -> int:
@@ -170,21 +166,33 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # Core division not supported if there are broadcasts
             return
 
-    # Split along the stick dimension, which is always the last op-dim ("out").
-    # The device_size stick dimension index is used only to determine the split count.
-    device_size = output.device_layout.device_size
-    split_idx = -3 if len(device_size) == 4 else 0  # stick dim in device space
-    num_cores = core_split(device_size[split_idx], max_cores)
+    # Split along the stick dimension
+    # Find the stick count device dimension: the device dim where dim_map[i] ==
+    # host_stick_dim() and i is not the last device dim (the last device dim is
+    # always the intra-stick dimension). This is correct for all device layout
+    # shapes (2D, 3D, 4D) and avoids the zero-division issue when the unpadded
+    # element count is smaller than elems_per_stick.
+    dl = output.device_layout
+    stick_host_dim = dl.host_stick_dim()
+
+    # sparse tensor - can't split stick dimensions
+    if stick_host_dim is None:
+        return
+
+    stick_count_dev_dim = next(
+        i for i, d in enumerate(dl.dim_map[:-1]) if d == stick_host_dim
+    )
+    num_sticks = dl.device_size[stick_count_dev_dim]
+    num_cores = core_split(num_sticks, max_cores)
     if num_cores > 1:
         n.n_cores_used = num_cores
-        # op_dim_splits matches dim_labels = INPUT_DIM_LABELS[:ndim-1] + OUTPUT_DIM_LABELS[:1]
-        # The split is always on the last op-dim (the "out" / stick dimension).
-        n.op_dim_splits = [1] * (ndim - 1) + [num_cores]
+        n.op_dim_splits = [
+            (1 if i != stick_host_dim else num_cores) for i in range(ndim)
+        ]
 
 
 def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     red: Reduction = n.node.data
-    output: FixedLayout = n.node.get_layout()
     n.n_cores_used = 1
 
     if max_cores == 1:
@@ -223,7 +231,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # dim_labels in codegen: ["x", "mb", "in", "out"] = [B, M, K, N]
             # op_dim_splits indices:   0=B,  1=M,  2=K,  3=N
 
-            # Get operation dimension sizes from host layouts.
+            # Get operation dimension sizes from host layouts
             B = get_host_dim_size(args[0].layout, 0)
             M = get_host_dim_size(args[0].layout, 1)
             N = get_host_dim_size(args[1].layout, -1)
@@ -243,7 +251,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # dim_labels in codegen: ["x", "y", "mb", "in", "out"] = [B1, B2, M, K, N]
             # op_dim_splits indices:   0=B1, 1=B2, 2=M,  3=K,  4=N
 
-            # Get operation dimension sizes from host layouts.
+            # Get operation dimension sizes from host layouts
             B1 = get_host_dim_size(args[0].layout, 0)
             B2 = get_host_dim_size(args[0].layout, 1)
             M = get_host_dim_size(args[0].layout, 2)

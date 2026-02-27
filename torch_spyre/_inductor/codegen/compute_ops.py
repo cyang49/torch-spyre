@@ -499,11 +499,7 @@ def create_tensor_specific_layouts(
 
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
-
     data_format = inputs[0]["device_layout"].device_dtype
-
-    d3 = len(dimensions) >= 3
-
     ndim = len(dimensions)
 
     # implement core division on stick dimension
