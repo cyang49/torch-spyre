@@ -41,6 +41,36 @@ aten = torch.ops.aten
 spyreop = torch.ops.spyre
 
 
+def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
+    """
+    Get the parallelizable size of a host dimension.
+
+    For non-stick dimensions this is simply the dimension size. For the stick
+    dimension (the last host dimension), the elements are packed into sticks, so
+    the parallelizable unit is the number of sticks rather than the number of
+    elements.
+
+    Args:
+        layout: The tensor's FixedTiledLayout
+        host_dim_idx: The host dimension index (negative indices are supported)
+
+    Returns:
+        The number of parallelizable units along this dimension
+    """
+    if host_dim_idx < 0:
+        host_dim_idx = len(layout.size) + host_dim_idx
+
+    assert host_dim_idx < len(layout.size)
+
+    if host_dim_idx != layout.device_layout.host_stick_dim():
+        return int(layout.size[host_dim_idx])
+    else:  # stick dim: parallelizable unit is number of sticks
+        return (
+            int(layout.size[host_dim_idx])
+            // layout.device_layout.elems_per_stick()
+        )
+
+
 def core_split(size: int, max_cores: int) -> int:
     """
     Find the largest divisor of size that doesn't exceed max_cores.
@@ -167,9 +197,9 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # dim_labels in codegen: ["mb", "in", "out"] = [M, K, N]
         # op_dim_splits indices:   0=M,  1=K,  2=N
 
-        # Get operation dimension sizes from host layouts
-        M = int(args[0].layout.size[0])
-        N = int(args[1].layout.size[1])
+        # Get operation dimension sizes from host layouts.
+        M = get_host_dim_size(args[0].layout, 0)
+        N = get_host_dim_size(args[1].layout, 1)
 
         # Parallelizable operation dimensions: M and N (not K, the reduction dim)
         sizes = [M, N]
@@ -193,10 +223,10 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # dim_labels in codegen: ["x", "mb", "in", "out"] = [B, M, K, N]
             # op_dim_splits indices:   0=B,  1=M,  2=K,  3=N
 
-            # Get operation dimension sizes from host layouts
-            B = int(args[0].layout.size[0])
-            M = int(args[0].layout.size[1])
-            N = int(args[1].layout.size[-1])
+            # Get operation dimension sizes from host layouts.
+            B = get_host_dim_size(args[0].layout, 0)
+            M = get_host_dim_size(args[0].layout, 1)
+            N = get_host_dim_size(args[1].layout, -1)
 
             # Parallelizable operation dimensions: B, M, N (not K, the reduction dim)
             sizes = [B, M, N]
@@ -213,11 +243,11 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # dim_labels in codegen: ["x", "y", "mb", "in", "out"] = [B1, B2, M, K, N]
             # op_dim_splits indices:   0=B1, 1=B2, 2=M,  3=K,  4=N
 
-            # Get operation dimension sizes from host layouts
-            B1 = int(args[0].layout.size[0])
-            B2 = int(args[0].layout.size[1])
-            M = int(args[0].layout.size[2])
-            N = int(args[1].layout.size[3])
+            # Get operation dimension sizes from host layouts.
+            B1 = get_host_dim_size(args[0].layout, 0)
+            B2 = get_host_dim_size(args[0].layout, 1)
+            M = get_host_dim_size(args[0].layout, 2)
+            N = get_host_dim_size(args[1].layout, -1)
 
             # Parallelizable operation dimensions: B1, B2, M, N (not K, the reduction dim)
             sizes = [B1, B2, M, N]
