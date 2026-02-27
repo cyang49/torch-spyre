@@ -171,10 +171,11 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             return
 
     # Split along the stick dimension, which is always the last op-dim ("out").
-    # The device_size stick dimension index is used only to determine the split count.
-    device_size = output.device_layout.device_size
-    split_idx = -3 if len(device_size) == 4 else 0  # stick dim in device space
-    num_cores = core_split(device_size[split_idx], max_cores)
+    # Use get_host_dim_size for the last host dim (stick dim) to get the
+    # parallelizable unit count (number of sticks, not raw elements).
+    # This is correct for all device layout shapes (2D, 3D, 4D).
+    num_sticks = get_host_dim_size(output, -1)
+    num_cores = core_split(num_sticks, max_cores)
     if num_cores > 1:
         n.n_cores_used = num_cores
         # op_dim_splits matches dim_labels = INPUT_DIM_LABELS[:ndim-1] + OUTPUT_DIM_LABELS[:1]
