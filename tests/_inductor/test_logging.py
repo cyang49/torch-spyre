@@ -26,36 +26,29 @@ from torch_spyre._inductor.logging_utils import (
 
 
 class TestLoggingConfiguration:
-    def test_logging_disabled_by_default(self):
+    def test_default_is_disabled(self):
         with patch.object(logging_utils, "_INDUCTOR_LOGGING_ENABLED", None):
             with patch.dict(os.environ, {}, clear=True):
                 assert not is_inductor_logging_enabled()
+                logger = get_inductor_logger("test_disabled")
+                assert logger.level == logging.CRITICAL
 
-    def test_logging_enabled(self):
+    def test_enabled_defaults_to_debug_level(self):
         with patch.object(logging_utils, "_INDUCTOR_LOGGING_ENABLED", None):
-            with patch.dict(os.environ, {"SPYRE_INDUCTOR_LOG": "1"}):
+            with patch.dict(os.environ, {"SPYRE_INDUCTOR_LOG": "1"}, clear=True):
                 assert is_inductor_logging_enabled()
-
-    def test_log_level_when_enabled(self):
-        with patch.dict(os.environ, {"SPYRE_INDUCTOR_LOG": "1"}):
-            logger = get_inductor_logger("test_enabled")
-            assert logger.level == logging.DEBUG
-
-    def test_log_level_when_disabled(self):
-        with patch.dict(os.environ, {}, clear=True):
-            logger = get_inductor_logger("test_disabled")
-            assert logger.level == logging.CRITICAL
+                logger = get_inductor_logger("test_enabled")
+                assert logger.level == logging.DEBUG
 
 
 class TestLoggingOperations:
-    def test_logger_creation(self):
+    def test_create_logger(self):
         logger = get_inductor_logger("test_module")
         assert logger is not None
         assert logger.name.endswith("test_module")
 
-    def test_logging_calls(self):
+    def test_logging_does_not_crash(self):
         logger = get_inductor_logger("test")
-        # These should not raise exceptions
         logger.debug("test message")
         logger.info("test message")
         logger.warning("test message")
