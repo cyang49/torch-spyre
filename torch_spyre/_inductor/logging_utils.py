@@ -16,8 +16,8 @@
 Minimal logging infrastructure for torch_spyre._inductor.
 
 Environment Variables:
-    SPYRE_INDUCTOR_LOG_LEVEL: Log level (ERROR|WARNING|INFO|DEBUG)
-    SPYRE_TENSOR_LOG: Enable tensor-specific logging (0|1)
+    SPYRE_INDUCTOR_LOG: Enable inductor logging (0|1, default: 0)
+    SPYRE_INDUCTOR_LOG_LEVEL: Log level when enabled (ERROR|WARNING|INFO|DEBUG, default: DEBUG)
     SPYRE_LOG_FILE: Path to log file (default: stderr)
 """
 
@@ -26,9 +26,8 @@ import os
 import sys
 from typing import Optional
 
-# Global configuration state
-_LOGGING_CONFIGURED = False
-_TENSOR_LOGGING_ENABLED: Optional[bool] = None
+# Global state
+_INDUCTOR_LOGGING_ENABLED: Optional[bool] = None
 
 
 def _get_env_bool(var_name: str, default: bool = False) -> bool:
@@ -37,15 +36,17 @@ def _get_env_bool(var_name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
-def _initialize_config() -> None:
-    """Initialize logging configuration from environment variables."""
-    global _LOGGING_CONFIGURED, _TENSOR_LOGGING_ENABLED
+def is_inductor_logging_enabled() -> bool:
+    """
+    Check if inductor logging is enabled via SPYRE_INDUCTOR_LOG.
 
-    if _LOGGING_CONFIGURED:
-        return
-
-    _TENSOR_LOGGING_ENABLED = _get_env_bool("SPYRE_TENSOR_LOG", False)
-    _LOGGING_CONFIGURED = True
+    Returns:
+        True if inductor logging is enabled, False otherwise
+    """
+    global _INDUCTOR_LOGGING_ENABLED
+    if _INDUCTOR_LOGGING_ENABLED is None:
+        _INDUCTOR_LOGGING_ENABLED = _get_env_bool("SPYRE_INDUCTOR_LOG", False)
+    return _INDUCTOR_LOGGING_ENABLED
 
 
 def get_inductor_logger(name: str) -> logging.Logger:
@@ -58,15 +59,19 @@ def get_inductor_logger(name: str) -> logging.Logger:
     Returns:
         Configured logger instance
     """
-    _initialize_config()
-
     logger_name = f"torch_spyre._inductor.{name}"
     logger = logging.getLogger(logger_name)
 
     # Configure if not already done
     if not logger.handlers:
-        level_str = os.getenv("SPYRE_INDUCTOR_LOG_LEVEL", "WARNING").upper()
-        level = getattr(logging, level_str, logging.WARNING)
+        if is_inductor_logging_enabled():
+            # When enabled, default to DEBUG level
+            level_str = os.getenv("SPYRE_INDUCTOR_LOG_LEVEL", "DEBUG").upper()
+            level = getattr(logging, level_str, logging.DEBUG)
+        else:
+            # When disabled, set to CRITICAL to suppress all normal logging
+            level = logging.CRITICAL
+
         logger.setLevel(level)
 
         # Create handler
@@ -84,14 +89,3 @@ def get_inductor_logger(name: str) -> logging.Logger:
         logger.propagate = False
 
     return logger
-
-
-def is_logging_enabled() -> bool:
-    """
-    Check if tensor logging is enabled via SPYRE_TENSOR_LOG.
-
-    Returns:
-        True if tensor logging is enabled, False otherwise
-    """
-    _initialize_config()
-    return bool(_TENSOR_LOGGING_ENABLED)

@@ -19,7 +19,7 @@ from torch_spyre._inductor.constants import (
     CLONE_OP,
 )
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.logging_utils import get_inductor_logger, is_logging_enabled
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 import logging
 from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
 from .data_ops import (
@@ -34,7 +34,7 @@ logger = get_inductor_logger("codegen.superdsc")
 
 
 def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
-    if is_logging_enabled() and logger.isEnabledFor(logging.DEBUG):
+    if logger.isEnabledFor(logging.DEBUG):
         # Extract key information for logging
         input_info = []
         for inp in inputs:
