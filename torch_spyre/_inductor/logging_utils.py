@@ -17,7 +17,7 @@ Minimal logging infrastructure for torch_spyre._inductor.
 
 Environment Variables:
     SPYRE_INDUCTOR_LOG: Enable inductor logging (0|1, default: 0)
-    SPYRE_INDUCTOR_LOG_LEVEL: Log level when enabled (ERROR|WARNING|INFO|DEBUG, default: DEBUG)
+    SPYRE_INDUCTOR_LOG_LEVEL: Log level when enabled (ERROR|WARNING|INFO|DEBUG, default: INFO)
     SPYRE_LOG_FILE: Path to log file (default: stderr)
 """
 
