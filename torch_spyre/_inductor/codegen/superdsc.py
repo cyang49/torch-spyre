@@ -35,48 +35,9 @@ logger = get_inductor_logger("codegen.superdsc")
 
 def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     if logger.isEnabledFor(logging.DEBUG):
-        # Extract key information for logging
-        input_info = []
-        for inp in inputs:
-            input_info.append(
-                {
-                    "host_size": inp.get("host_size"),
-                    "device_size": inp["device_layout"].device_size
-                    if "device_layout" in inp
-                    else None,
-                    "dtype": str(inp["device_layout"].device_dtype)
-                    if "device_layout" in inp
-                    else None,
-                }
-            )
-
-        output_info = []
-        for out in outputs:
-            output_info.append(
-                {
-                    "host_size": out.get("host_size"),
-                    "device_size": out["device_layout"].device_size
-                    if "device_layout" in out
-                    else None,
-                    "dtype": str(out["device_layout"].device_dtype)
-                    if "device_layout" in out
-                    else None,
-                }
-            )
-
         logger.debug(
-            f"SDSC generation: {op}",
-            extra={
-                "stage": "sdsc_generation",
-                "op": op,
-                "dimensions": dimensions,
-                "is_reduction": reduction,
-                "num_inputs": len(inputs),
-                "num_outputs": len(outputs),
-                "input_info": input_info,
-                "output_info": output_info,
-                "op_info": kwargs.get("op_info", {}),
-            },
+            f"SDSC generation: op={op}, dimensions={dimensions}, "
+            f"is_reduction={reduction}, num_inputs={len(inputs)}, num_outputs={len(outputs)}"
         )
 
     if op == MATMUL_REDUCTION_OP:
