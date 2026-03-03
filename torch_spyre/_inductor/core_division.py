@@ -337,10 +337,10 @@ def core_division_planning(
                 # Core division not supported on fallback kernels
                 pass
             else:
-                print(f"Warning: unhandled node type {type(n.node)}")
+                logger.warning(f"unhandled node type {type(n.node)}")
         elif isinstance(n, NopKernelSchedulerNode):
             pass
         else:
-            print(f"Warning: unhandled scheduler node type {type(n)}")
+            logger.warning(f"unhandled scheduler node type {type(n)}")
 
     return nodes

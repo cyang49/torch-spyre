@@ -31,14 +31,14 @@ class TestLoggingConfiguration:
             with patch.dict(os.environ, {}, clear=True):
                 assert not is_inductor_logging_enabled()
                 logger = get_inductor_logger("test_disabled")
-                assert logger.level == logging.CRITICAL
+                assert logger.level == logging.WARNING
 
-    def test_enabled_defaults_to_debug_level(self):
+    def test_enabled_defaults_to_info_level(self):
         with patch.object(logging_utils, "_INDUCTOR_LOGGING_ENABLED", None):
             with patch.dict(os.environ, {"SPYRE_INDUCTOR_LOG": "1"}, clear=True):
                 assert is_inductor_logging_enabled()
                 logger = get_inductor_logger("test_enabled")
-                assert logger.level == logging.DEBUG
+                assert logger.level == logging.INFO
 
 
 class TestLoggingOperations:

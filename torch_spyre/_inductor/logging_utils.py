@@ -65,12 +65,12 @@ def get_inductor_logger(name: str) -> logging.Logger:
     # Configure if not already done
     if not logger.handlers:
         if is_inductor_logging_enabled():
-            # When enabled, default to DEBUG level
-            level_str = os.getenv("SPYRE_INDUCTOR_LOG_LEVEL", "DEBUG").upper()
-            level = getattr(logging, level_str, logging.DEBUG)
+            # When enabled, default to INFO level
+            level_str = os.getenv("SPYRE_INDUCTOR_LOG_LEVEL", "INFO").upper()
+            level = getattr(logging, level_str, logging.INFO)
         else:
-            # When disabled, set to CRITICAL to suppress all normal logging
-            level = logging.CRITICAL
+            # When disabled, set to WARNING to suppress all normal logging
+            level = logging.WARNING
 
         logger.setLevel(level)
 
