@@ -113,11 +113,15 @@ def multi_dim_core_split(
     2. Dimension size (larger dimensions get priority)
     3. Divisibility (dimensions that divide evenly get priority)
 
+    Dimensions with negative priorities are excluded from splitting and will
+    always have a split value of 1.
+
     Args:
         sizes: List of dimension sizes that can be parallelized
         max_cores: Total number of cores available
         priorities: Optional list of priority values (higher = more important)
-                   If None, uses dimension sizes as priorities
+                   If None, uses dimension sizes as priorities.
+                   Use negative values to exclude dimensions from splitting.
 
     Returns:
         List of core splits for each dimension (same length as sizes)
@@ -129,6 +133,9 @@ def multi_dim_core_split(
 
         >>> multi_dim_core_split([100, 50], max_cores=10)
         [5, 2]  # 5*2 = 10 cores total
+
+        >>> multi_dim_core_split([128, 64, 32], max_cores=8, priorities=[3, -1, 2])
+        [4, 1, 2]  # Middle dimension excluded from splitting (priority=-1)
     """
     if not sizes:
         return []
@@ -141,7 +148,10 @@ def multi_dim_core_split(
         priorities = sizes.copy()
 
     # Create list of (dimension_index, size, priority) tuples
-    dim_info = [(i, sizes[i], priorities[i]) for i in range(n_dims)]
+    # Filter out dimensions with negative priorities (they should not be split)
+    dim_info = [
+        (i, sizes[i], priorities[i]) for i in range(n_dims) if priorities[i] >= 0
+    ]
 
     # Sort by priority (descending), then by size (descending)
     dim_info.sort(key=lambda x: (x[2], x[1]), reverse=True)
@@ -203,7 +213,9 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             )
 
 
-def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
+def divide_reduction_op(
+    n: SchedulerNode, args: list[SchedNodeArg], max_cores, enable_splitk=False
+):
     red: Reduction = n.node.data
     n.n_cores_used = 1
 
@@ -223,8 +235,9 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
         # Parallelizable operation dimensions: M, K, and N
         # K has lowest priority (1) - only split when M and N are exhausted
+        # Use negative priority to exclude K from splitting when splitk is disabled
         sizes = [M, K, N]
-        priorities = [3, 1, 2]
+        priorities = [3, 1 if enable_splitk else -1, 2]
         splits = multi_dim_core_split(sizes, max_cores, priorities)
         n.n_cores_used = math.prod(splits)
 
@@ -256,8 +269,9 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
             # Parallelizable operation dimensions: B, M, K, and N
             # K has lowest priority (1) - only split when B, M, and N are exhausted
+            # Use negative priority to exclude K from splitting when splitk is disabled
             sizes = [B, M, K, N]
-            priorities = [4, 2, 1, 3]
+            priorities = [4, 2, 1 if enable_splitk else -1, 3]
             splits = multi_dim_core_split(sizes, max_cores, priorities)
             n.n_cores_used = math.prod(splits)
 
@@ -283,9 +297,10 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
             # Parallelizable operation dimensions: B1, B2, M, K, and N
             # K has lowest priority (1) - only split when B1, B2, M, and N are exhausted
+            # Use negative priority to exclude K from splitting when splitk is disabled
             # NOTE: split priority can affect numerical error in unit tests
             sizes = [B1, B2, M, K, N]
-            priorities = [4, 5, 2, 1, 3]
+            priorities = [4, 5, 2, 1 if enable_splitk else -1, 3]
             splits = multi_dim_core_split(sizes, max_cores, priorities)
             n.n_cores_used = math.prod(splits)
 
