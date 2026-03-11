@@ -214,7 +214,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
 
 def divide_reduction_op(
-    n: SchedulerNode, args: list[SchedNodeArg], max_cores, enable_splitk=False
+    n: SchedulerNode, args: list[SchedNodeArg], max_cores, enable_splitk=True
 ):
     red: Reduction = n.node.data
     n.n_cores_used = 1
