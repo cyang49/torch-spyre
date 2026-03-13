@@ -26,6 +26,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from .temp_passes import relayout_linear_weights, replace_scalar_with_tensor
 from .stickify import propagate_spyre_tensor_layouts
+from .access_info import compute_access_info
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 from .constants import DEVICE_NAME
@@ -110,6 +111,7 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
 
     nodes = propagate_spyre_tensor_layouts(nodes)
+    nodes = compute_access_info(nodes)
     nodes = core_division_planning(nodes)
     if os.environ.get("LX_PLANNING", "0") == "1":
         nodes = scratchpad_planning(nodes)

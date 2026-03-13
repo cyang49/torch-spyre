@@ -198,6 +198,18 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     # Use sizes as priorities (larger dimensions get higher priority)
     priorities = sizes.copy()
 
+    # NOTE: Access info is available via n.access_info (computed by compute_access_info pass)
+    # It contains:
+    #   - n.access_info.op_dim_sizes: Operation dimension sizes
+    #   - n.access_info.input_info: List of TensorAccessInfo for inputs
+    #   - n.access_info.output_info: TensorAccessInfo for output
+    # Each TensorAccessInfo has:
+    #   - .it_dim_map: Maps tensor dims to operation dims
+    #   - .host_coords: Host coordinate expressions
+    #   - .device_coords: Device coordinate expressions
+    #   - .layout: FixedTiledLayout
+    # This can be used for more sophisticated split strategies based on memory access patterns.
+
     # Use multi-dimensional core splitting
     splits = multi_dim_core_split(sizes, max_cores, priorities)
     n.n_cores_used = math.prod(splits)
