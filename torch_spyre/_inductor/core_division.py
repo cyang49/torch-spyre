@@ -173,6 +173,64 @@ def multi_dim_core_split(
     return splits
 
 
+def get_broadcast_safe_dimensions(
+    output: FixedTiledLayout, args: list[SchedNodeArg]
+) -> list[bool]:
+    """
+    Determine which output dimensions are safe for parallelization with broadcasts.
+
+    A dimension is safe for parallelization if all input tensors either:
+    1. Have the same size as the output in that dimension, OR
+    2. Have size 1 in that dimension (broadcast dimension)
+
+    The key insight is that we can parallelize along dimensions where inputs
+    are either matching or broadcasting, but we need to be careful about
+    dimensions that don't exist in some inputs.
+
+    Broadcasting in PyTorch aligns dimensions from the right (trailing dimensions),
+    so we must compare host layout sizes, not device dimension sizes.
+
+    Args:
+        output: The output tensor's layout
+        args: List of input tensor arguments
+
+    Returns:
+        List of booleans, one per output dimension, indicating if that
+        dimension is safe for parallelization (True) or should be excluded (False)
+    """
+    ndim = len(output.size)
+    safe_dims = [True] * ndim
+
+    for arg in args:
+        arg_ndim = len(arg.layout.size)
+
+        # Handle dimension mismatch - inputs can have fewer dimensions than output
+        # due to broadcasting. We align dimensions from the right (trailing dimensions).
+        dim_offset = ndim - arg_ndim
+
+        for out_dim_idx in range(ndim):
+            # Calculate corresponding input dimension index
+            arg_dim_idx = out_dim_idx - dim_offset
+
+            if arg_dim_idx < 0:
+                # This output dimension doesn't exist in the input (implicit broadcast from size 1)
+                # We CANNOT parallelize this dimension because the input will be broadcast
+                safe_dims[out_dim_idx] = False
+                continue
+
+            # Compare HOST layout sizes (not device dimension sizes)
+            # This is critical because device sizes may differ due to stickification
+            output_size = output.size[out_dim_idx]
+            arg_size = arg.layout.size[arg_dim_idx]
+
+            # Dimension is safe if sizes match OR input has size 1 (broadcast)
+            if arg_size != output_size and arg_size != 1:
+                # Input has different size (not 1, not matching) - cannot parallelize
+                safe_dims[out_dim_idx] = False
+
+    return safe_dims
+
+
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     output: FixedTiledLayout = n.node.get_layout()
     ndim = len(output.size)
@@ -185,18 +243,32 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # Core division currently only implemented for 1 or 2 tensors
         return
 
-    for a in args:
-        if a.layout.size != output.size:
-            # Core division not supported if there are broadcasts
-            return
+    # Check if any inputs have different shapes (broadcasting)
+    has_broadcast = any(a.layout.size != output.size for a in args)
 
     # Collect parallelizable sizes for all host dimensions
     # For stick dimension: this returns the number of sticks
     # For non-stick dimensions: this returns the dimension size
     sizes = [get_host_dim_size(output, i) for i in range(ndim)]
 
-    # Use sizes as priorities (larger dimensions get higher priority)
-    priorities = sizes.copy()
+    # Use sizes as base priorities (larger dimensions get higher priority)
+    # priorities = sizes.copy()
+    priorities = list(range(ndim, 0, -1))
+
+    if has_broadcast:
+        # Determine which dimensions are safe for parallelization with broadcasts
+        safe_dims = get_broadcast_safe_dimensions(output, args)
+
+        # Set negative priority for unsafe dimensions to exclude them from splitting
+        for i in range(ndim):
+            if not safe_dims[i]:
+                priorities[i] = -1
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"pointwise broadcast detected for {n.node.get_name()}: "
+                f"output_size={output.size}, safe_dims={safe_dims}"
+            )
 
     # Use multi-dimensional core splitting
     splits = multi_dim_core_split(sizes, max_cores, priorities)

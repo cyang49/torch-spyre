@@ -35,9 +35,20 @@ The product of all dimension splits equals the total number of cores used. For e
 Pointwise operations perform element-wise computations where each output element depends only on corresponding input elements at the same position. Examples include addition, multiplication, and activation functions.
 
 **Parallelization Strategy:**
-- Split along the innermost dimension (stick dimension) in the device layout
-- Only applicable when all tensors have identical shapes (no broadcasting)
-- Each core processes a contiguous slice of the tensor
+- Split along output dimensions, prioritizing larger dimensions
+- Supports broadcasting: dimensions are analyzed to determine which are safe for parallelization
+- A dimension is safe for parallelization if all inputs either:
+  - Have the same size as the output in that dimension, OR
+  - Have size 1 in that dimension (broadcast dimension), OR
+  - Don't have that dimension (implicit broadcast from size 1)
+- Dimensions that are unsafe for parallelization (different non-1 sizes) are excluded from splitting
+- Each core processes a contiguous slice of the output tensor
+
+**Broadcast Examples:**
+- `[256] + [256, 256] → [256, 256]`: Can parallelize the second dimension (256), first dimension excluded (broadcast)
+- `[1, 256] + [256, 256] → [256, 256]`: Can parallelize the second dimension (256), first dimension excluded (broadcast from size 1)
+- `[256, 256] + [256, 256] → [256, 256]`: Can parallelize both dimensions (no broadcast)
+- `[256, 1] + [256, 256] → [256, 256]`: Can parallelize the first dimension (256), second dimension excluded (broadcast from size 1)
 
 ### Reduction Operations
 
