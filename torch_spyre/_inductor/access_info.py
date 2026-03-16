@@ -216,8 +216,8 @@ def compute_bmm_access_info(n: SchedulerNode, args: list[SchedNodeArg]) -> OpAcc
     if num_dims == 3:
         # 3D BMM
         B = get_host_dim_size(args[0].layout, 0)
-        M = get_host_dim_size(args[0].layout, 1)
-        K = get_host_dim_size(args[0].layout, 2)
+        M = get_host_dim_size(args[0].layout, -2)
+        K = get_host_dim_size(args[0].layout, -1)
         N = get_host_dim_size(args[1].layout, -1)
         op_dim_sizes = [B, M, K, N]
 
@@ -254,8 +254,8 @@ def compute_bmm_access_info(n: SchedulerNode, args: list[SchedNodeArg]) -> OpAcc
         # 4D BMM
         B1 = get_host_dim_size(args[0].layout, 0)
         B2 = get_host_dim_size(args[0].layout, 1)
-        M = get_host_dim_size(args[0].layout, 2)
-        K = get_host_dim_size(args[0].layout, 3)
+        M = get_host_dim_size(args[0].layout, -2)
+        K = get_host_dim_size(args[0].layout, -1)
         N = get_host_dim_size(args[1].layout, -1)
         op_dim_sizes = [B1, B2, M, K, N]
 
