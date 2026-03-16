@@ -41,7 +41,13 @@ from torch._inductor.scheduler import (
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
-from .pass_utils import SchedNodeArg, get_mem_deps, host_coordinates, device_coordinates
+from .pass_utils import (
+    SchedNodeArg,
+    get_mem_deps,
+    host_coordinates,
+    device_coordinates,
+    get_host_dim_size,
+)
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("access_info")
@@ -90,13 +96,16 @@ def compute_pointwise_access_info(
     Compute access info for pointwise operations.
 
     For pointwise ops, operation dimensions = host dimensions (identity mapping).
+    For work division, we need parallelizable sizes (number of sticks for stick dimension).
     """
     output: FixedTiledLayout = n.node.get_layout()
     output_dep = next(iter(n.read_writes.writes))
     ndim = len(output.size)
 
-    # For pointwise, operation dimensions are the same as host dimensions
-    op_dim_sizes = [int(output.size[i]) for i in range(ndim)]
+    # For pointwise, operation dimensions use parallelizable sizes
+    # For stick dimension: this returns the number of sticks
+    # For non-stick dimensions: this returns the dimension size
+    op_dim_sizes = [get_host_dim_size(output, i) for i in range(ndim)]
 
     # Compute info for each input
     input_info = []
@@ -146,8 +155,6 @@ def compute_matmul_access_info(
     assert len(args) == 2, "matmul has exactly 2 inputs"
 
     # Get operation dimension sizes from host layouts
-    from .core_division import get_host_dim_size
-
     M = get_host_dim_size(args[0].layout, 0)
     K = get_host_dim_size(args[0].layout, 1)
     N = get_host_dim_size(args[1].layout, 1)
@@ -205,8 +212,6 @@ def compute_bmm_access_info(n: SchedulerNode, args: list[SchedNodeArg]) -> OpAcc
     output: FixedTiledLayout = n.node.get_layout()
     output_dep = next(iter(n.read_writes.writes))
     num_dims = len(args[0].layout.size)
-
-    from .core_division import get_host_dim_size
 
     if num_dims == 3:
         # 3D BMM

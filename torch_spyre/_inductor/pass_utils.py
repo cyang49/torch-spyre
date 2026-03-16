@@ -88,3 +88,42 @@ def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.E
         dep.ranges,
         dep.index,
     )
+
+
+def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
+    """
+    Get the parallelizable size of a host dimension.
+
+    For non-stick dimensions this is simply the dimension size. For the stick
+    dimension (the last host dimension), the elements are packed into sticks, so
+    the parallelizable unit is the number of sticks rather than the number of
+    elements.
+
+    This function properly consults the dim_map to find which device dimension
+    corresponds to the requested host dimension, handling tiling and sparse tensors.
+
+    Args:
+        layout: The tensor's FixedTiledLayout
+        host_dim_idx: The host dimension index (negative indices are supported)
+
+    Returns:
+        The number of parallelizable units along this dimension
+    """
+    if host_dim_idx < 0:
+        host_dim_idx = len(layout.size) + host_dim_idx
+
+    assert host_dim_idx < len(layout.size)
+
+    dl = layout.device_layout
+
+    # Use dim_map to find the device dimension that corresponds to this host dimension
+    # For tiled dimensions (appearing multiple times in dim_map), we use the first occurrence
+    # which corresponds to the outermost device dimension for that host dimension
+    try:
+        device_dim_idx = dl.dim_map.index(host_dim_idx)
+    except ValueError:
+        raise RuntimeError(
+            f"Host dimension {host_dim_idx} not found in dim_map {dl.dim_map}"
+        )
+
+    return dl.device_size[device_dim_idx]
