@@ -163,14 +163,12 @@ def divide_pointwise_op(n: SchedulerNode, max_cores):
     # Use sizes as priorities (larger dimensions get higher priority)
     priorities = sizes.copy()
 
-    # Use multi-dimensional core splitting
     splits = multi_dim_core_split(sizes, max_cores, priorities)
     n.n_cores_used = math.prod(splits)
 
     if n.n_cores_used > 1:
         n.op_dim_splits = splits
 
-        # Consolidated DEBUG log for pointwise work division
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
@@ -195,21 +193,17 @@ def divide_reduction_op(n: SchedulerNode, max_cores, enable_splitk=True):
     access_info = n.access_info
 
     if red.reduction_type == MATMUL_REDUCTION_OP:
-        # Operation dimensions: [M, K] @ [K, N] --> [M, N]
-        # dim_labels in codegen: ["mb", "in", "out"] = [M, K, N]
-
-        # Use pre-computed op_dim_sizes: [M, K, N]
+        # Operation dimensions: [M, K, N]
         sizes = access_info.op_dim_sizes
-        assert len(sizes) == 3, f"Expected 3 dims for matmul, got {len(sizes)}"
+        assert len(sizes) == 3, f"Expected 3 dims for mm, got {len(sizes)}"
 
-        # Parallelizable operation dimensions: M, K, and N
         # K has lowest priority (1) - only split when M and N are exhausted
         # Use negative priority to exclude K from splitting when splitk is disabled
+        # TODO: minimize memory access span by setting priorities according to
+        #       device tensor layout
         priorities = [3, 1 if enable_splitk else -1, 2]
         splits = multi_dim_core_split(sizes, max_cores, priorities)
         n.n_cores_used = math.prod(splits)
-
-        # Store op_dim_splits directly matching dim_labels = ["mb", "in", "out"]
         n.op_dim_splits = splits
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -224,18 +218,13 @@ def divide_reduction_op(n: SchedulerNode, max_cores, enable_splitk=True):
         sizes = access_info.op_dim_sizes
 
         if len(sizes) == 4:
-            # 3D BMM: [B, M, K] @ [B, K, N] --> [B, M, N]
-            #     or  [B, M, K] @ [K, N] --> [B, M, N]
-            # dim_labels in codegen: ["x", "mb", "in", "out"] = [B, M, K, N]
-
-            # Parallelizable operation dimensions: B, M, K, and N
+            # 3D BMM: [B, M, K, N]
             # K has lowest priority (1) - only split when B, M, and N are exhausted
             # Use negative priority to exclude K from splitting when splitk is disabled
+            # NOTE: split priority can affect numerical error in unit tests
             priorities = [4, 2, 1 if enable_splitk else -1, 3]
             splits = multi_dim_core_split(sizes, max_cores, priorities)
             n.n_cores_used = math.prod(splits)
-
-            # Store op_dim_splits directly matching dim_labels = ["x", "mb", "in", "out"]
             n.op_dim_splits = splits
 
             if logger.isEnabledFor(logging.DEBUG):
@@ -246,18 +235,10 @@ def divide_reduction_op(n: SchedulerNode, max_cores, enable_splitk=True):
                 )
 
         elif len(sizes) == 5:
-            # 4D BMM: [B1, B2, M, K] @ [B1, B2, K, N] --> [B1, B2, M, N]
-            # dim_labels in codegen: ["x", "y", "mb", "in", "out"] = [B1, B2, M, K, N]
-
-            # Parallelizable operation dimensions: B1, B2, M, K, and N
-            # K has lowest priority (1) - only split when B1, B2, M, and N are exhausted
-            # Use negative priority to exclude K from splitting when splitk is disabled
-            # NOTE: split priority can affect numerical error in unit tests
+            # 4D BMM: [B1, B2, M, K, N]
             priorities = [4, 5, 2, 1 if enable_splitk else -1, 3]
             splits = multi_dim_core_split(sizes, max_cores, priorities)
             n.n_cores_used = math.prod(splits)
-
-            # Store op_dim_splits directly matching dim_labels = ["x", "y", "mb", "in", "out"]
             n.op_dim_splits = splits
 
             if logger.isEnabledFor(logging.DEBUG):
