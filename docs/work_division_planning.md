@@ -95,15 +95,39 @@ This representation is operation-centric: it describes how the logical computati
 
 ## Planning Pipeline
 
-The work division planner processes operations in topological order, ensuring that dependencies are handled before dependent operations. For each operation:
+Work division planning is implemented as a two-pass process in the compiler pipeline:
 
-1. Determine if the operation type supports parallelization
-2. Extract tensor dimensions and device layouts
-3. Identify parallelizable dimensions based on operation semantics
-4. Apply the appropriate splitting strategy
-5. Annotate the operation with the core division specification
+### Pass 1: Access Information Analysis (`compute_access_info`)
 
-The maximum number of cores is configured via an environment variable and validated to be within hardware limits. Operations that don't support parallelization or have dimensions that don't divide evenly default to single-core execution.
+The first pass analyzes memory access patterns for each operation and computes:
+
+1. **Operation dimension sizes** - The parallelizable sizes for each operation dimension
+   - For pointwise operations: Uses `get_host_dim_size()` to get parallelizable sizes (number of sticks for stick dimension)
+   - For matmul: Extracts M, K, N dimensions from input tensor layouts
+   - For BMM: Extracts batch and matrix dimensions (B, M, K, N or B1, B2, M, K, N)
+
+2. **Dimension mappings** (`it_dim_map`) - Maps tensor dimensions to operation dimensions
+   - Pointwise: Identity mapping (tensor dims = operation dims)
+   - Matmul: Input A [M,K]→[0,1], Input B [K,N]→[1,2], Output [M,N]→[0,2]
+   - BMM: Similar mappings with additional batch dimensions
+
+3. **Coordinate expressions** - Host and device coordinate expressions for each tensor access
+
+This metadata is stored in `n.access_info` for use by downstream passes.
+
+### Pass 2: Core Division Planning (`core_division_planning`)
+
+The second pass uses the pre-computed access information to determine work distribution:
+
+1. Retrieve operation dimension sizes from `n.access_info.op_dim_sizes`
+2. Determine if the operation type supports parallelization
+3. Assign priorities to dimensions based on operation semantics
+4. Apply the multi-dimensional core splitting algorithm
+5. Annotate the operation with `op_dim_splits` and `n_cores_used`
+
+**Key Design Principle:** The `core_division_planning` pass does not recompute dimension sizes or analyze tensor layouts. It relies entirely on the metadata computed by `compute_access_info`, ensuring a single source of truth and eliminating redundant computation.
+
+The maximum number of cores is configured via the `SENCORES` environment variable and validated to be within hardware limits. Operations that don't support parallelization or have dimensions that don't divide evenly default to single-core execution.
 
 ## Limitations and Considerations
 
@@ -134,3 +158,5 @@ Potential enhancements to work division planning include:
 
 - [Work Division Code Generation](work_division_codegen.md) - How division plans are translated to executable code
 - [Tensor Layouts](tensor_layouts.md) - Understanding device layouts and dimensions
+- [`compute_access_info` pass](../torch_spyre/_inductor/access_info.py) - Pre-computes operation dimension sizes and access patterns
+- [`core_division_planning` pass](../torch_spyre/_inductor/core_division.py) - Uses access info to determine work distribution
