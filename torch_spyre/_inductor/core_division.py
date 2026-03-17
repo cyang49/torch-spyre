@@ -243,16 +243,21 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # Core division currently only implemented for 1 or 2 tensors
         return
 
-    # Check if any inputs have different shapes (broadcasting)
+    # Import is_sparse from stickify to check for sparse tensors
+    from .stickify import is_sparse
+
+    # Disable core division for sparse tensors with broadcasts (not yet supported)
     has_broadcast = any(a.layout.size != output.size for a in args)
+    if has_broadcast:
+        if is_sparse(output.device_layout) or any(
+            is_sparse(a.layout.device_layout) for a in args
+        ):
+            return
 
     # Collect parallelizable sizes for all host dimensions
-    # For stick dimension: this returns the number of sticks
-    # For non-stick dimensions: this returns the dimension size
     sizes = [get_host_dim_size(output, i) for i in range(ndim)]
 
-    # Use sizes as base priorities (larger dimensions get higher priority)
-    # priorities = sizes.copy()
+    # Use dimension index as base priority (earlier dimensions get higher priority)
     priorities = list(range(ndim, 0, -1))
 
     if has_broadcast:
@@ -266,8 +271,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"pointwise broadcast detected for {n.node.get_name()}: "
-                f"output_size={output.size}, safe_dims={safe_dims}"
+                f"pointwise broadcast for {n.node.get_name()}: safe_dims={safe_dims}"
             )
 
     # Use multi-dimensional core splitting
