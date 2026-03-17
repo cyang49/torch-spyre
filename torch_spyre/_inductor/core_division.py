@@ -30,6 +30,8 @@ from torch._inductor.scheduler import (
     NopKernelSchedulerNode,
 )
 
+
+from .stickify import is_sparse
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
@@ -243,9 +245,6 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # Core division currently only implemented for 1 or 2 tensors
         return
 
-    # Import is_sparse from stickify to check for sparse tensors
-    from .stickify import is_sparse
-
     # Disable core division for sparse tensors with broadcasts (not yet supported)
     has_broadcast = any(a.layout.size != output.size for a in args)
     if has_broadcast:
@@ -261,7 +260,6 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     priorities = list(range(ndim, 0, -1))
 
     if has_broadcast:
-        # Determine which dimensions are safe for parallelization with broadcasts
         safe_dims = get_broadcast_safe_dimensions(output, args)
 
         # Set negative priority for unsafe dimensions to exclude them from splitting
@@ -274,14 +272,11 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
                 f"pointwise broadcast for {n.node.get_name()}: safe_dims={safe_dims}"
             )
 
-    # Use multi-dimensional core splitting
     splits = multi_dim_core_split(sizes, max_cores, priorities)
     n.n_cores_used = math.prod(splits)
 
     if n.n_cores_used > 1:
         n.op_dim_splits = splits
-
-        # Consolidated DEBUG log for pointwise work division
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
