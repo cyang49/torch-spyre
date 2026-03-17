@@ -175,62 +175,52 @@ def multi_dim_core_split(
     return splits
 
 
-def get_broadcast_safe_dimensions(
+def if_broadcast_get_safe_dims(
     output: FixedTiledLayout, args: list[SchedNodeArg]
-) -> list[bool]:
+) -> tuple[bool, None | list[bool]]:
     """
-    Determine which output dimensions are safe for parallelization with broadcasts.
+    Check if inputs require broadcasting and determine safe dimensions for parallelization.
 
-    A dimension is safe for parallelization if all input tensors either:
-    1. Have the same size as the output in that dimension, OR
-    2. Have size 1 in that dimension (broadcast dimension)
+    Returns (False, None) for non-broadcast shape mismatches (e.g., squeeze/view operations).
+    Returns (True, safe_dims) for actual broadcasts, where safe_dims indicates which
+    output dimensions can be safely parallelized.
 
-    The key insight is that we can parallelize along dimensions where inputs
-    are either matching or broadcasting, but we need to be careful about
-    dimensions that don't exist in some inputs.
-
-    Broadcasting in PyTorch aligns dimensions from the right (trailing dimensions),
-    so we must compare host layout sizes, not device dimension sizes.
-
-    Args:
-        output: The output tensor's layout
-        args: List of input tensor arguments
-
-    Returns:
-        List of booleans, one per output dimension, indicating if that
-        dimension is safe for parallelization (True) or should be excluded (False)
+    Broadcasting aligns dimensions from the right (trailing dimensions).
     """
     ndim = len(output.size)
     safe_dims = [True] * ndim
+    is_broadcast_dim = [False] * ndim
 
     for arg in args:
         arg_ndim = len(arg.layout.size)
 
-        # Handle dimension mismatch - inputs can have fewer dimensions than output
-        # due to broadcasting. We align dimensions from the right (trailing dimensions).
+        if arg_ndim > ndim:
+            return False, None
+
         dim_offset = ndim - arg_ndim
 
         for out_dim_idx in range(ndim):
-            # Calculate corresponding input dimension index
             arg_dim_idx = out_dim_idx - dim_offset
 
+            # Implicit broadcast dimension (input has fewer dims than output)
+            # Mark as unsafe because codegen doesn't correctly handle address calculation
+            # when work is divided across cores for these dimensions
             if arg_dim_idx < 0:
-                # This output dimension doesn't exist in the input (implicit broadcast from size 1)
-                # We CANNOT parallelize this dimension because the input will be broadcast
+                is_broadcast_dim[out_dim_idx] = True
                 safe_dims[out_dim_idx] = False
                 continue
 
-            # Compare HOST layout sizes (not device dimension sizes)
-            # This is critical because device sizes may differ due to stickification
             output_size = output.size[out_dim_idx]
             arg_size = arg.layout.size[arg_dim_idx]
 
-            # Dimension is safe if sizes match OR input has size 1 (broadcast)
-            if arg_size != output_size and arg_size != 1:
-                # Input has different size (not 1, not matching) - cannot parallelize
-                safe_dims[out_dim_idx] = False
+            if arg_size == 1 and output_size > 1:
+                is_broadcast_dim[out_dim_idx] = True
 
-    return safe_dims
+            if arg_size != output_size and arg_size != 1:
+                return False, None
+
+    has_broadcast = any(is_broadcast_dim)
+    return has_broadcast, safe_dims if has_broadcast else None
 
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
@@ -252,12 +242,28 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # Core division currently only implemented for 1 or 2 tensors
         return
 
-    # Disable core division for sparse tensors with broadcasts (not yet supported)
-    has_broadcast = any(a.layout.size != output.size for a in args)
-    if has_broadcast:
+    has_shape_mismatch = any(a.layout.size != output.size for a in args)
+
+    if has_shape_mismatch:
+        has_broadcast, safe_dims = if_broadcast_get_safe_dims(output, args)
+
+        if not has_broadcast:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"pointwise {n.node.get_name()}: disabling parallelization due to "
+                    f"non-broadcast shape mismatch (output.size={output.size}, "
+                    f"arg sizes={[a.layout.size for a in args]})"
+                )
+            return
+
         if is_sparse(output.device_layout) or any(
             is_sparse(a.layout.device_layout) for a in args
         ):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"pointwise {n.node.get_name()}: disabling parallelization due to "
+                    f"sparse broadcast (not yet supported)"
+                )
             return
 
     # Collect parallelizable sizes for all host dimensions
@@ -266,11 +272,11 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     # Use dimension index as base priority (earlier dimensions get higher priority)
     priorities = list(range(ndim, 0, -1))
 
-    if has_broadcast:
-        safe_dims = get_broadcast_safe_dimensions(output, args)
-
+    if has_shape_mismatch:
+        # We know it's a broadcast at this point - use safe_dims for priority adjustment
         # Set negative priority for unsafe dimensions to exclude them from splitting
         for i in range(ndim):
+            assert safe_dims is not None
             if not safe_dims[i]:
                 priorities[i] = -1
 
