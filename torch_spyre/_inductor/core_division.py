@@ -238,6 +238,13 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     ndim = len(output.size)
     n.n_cores_used = 1
 
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"divide_pointwise_op {n.node.get_name()}: output.size={output.size}"
+        )
+        for i, a in enumerate(args):
+            logger.debug(f"  arg[{i}].layout.size={a.layout.size}")
+
     if max_cores == 1:
         return
 
