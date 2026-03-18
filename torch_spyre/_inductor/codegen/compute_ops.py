@@ -24,6 +24,11 @@ from torch_spyre._inductor.constants import (
     OUTPUT_DIM_LABELS,
 )
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+import logging
+
+logger = get_inductor_logger("compute_ops")
+
 
 def swap_last_two_elements(x: list):
     assert len(x) >= 2
@@ -238,21 +243,45 @@ def calculate_core_to_slice_mapping(
     return core_to_slice
 
 
+# NOTE: dim_info_list only contains operation dimensions that
+#       can map to this tensor. As a result we don't need to
+#       worry about the case when there's a mismatch between
+#       dim_info_list and device size
 def core_idx_to_slice_offset(
     dim_info_list: list[DimInfo],
     wk_slice: dict[str, int],
     device_size: list[int],
 ) -> int:
-    # compute tensor specific strides from its device layout
+    # Verbose logging
+    if logger.isEnabledFor(logging.DEBUG):
+        dim_labels = [di.label for di in dim_info_list]
+        dim_nsplits = [di.nsplits for di in dim_info_list]
+        logger.debug(
+            f"core_idx_to_slice_offset {dim_labels=} {device_size=} {dim_nsplits=} {wk_slice=}"
+        )
+
+    ndim = len(device_size) - 1
+    # assertion fails because there is irrelevant dim_info in the list
+    # assert len(dim_info_list) == ndim
+    # ensure only useful info is kept
+    dim_info_list = dim_info_list[:ndim]
+
     strides = {}
     for i, di in enumerate(dim_info_list):
+        # NOTE: dim_info_list is reversed order from least to most significant
         strides[di.label] = math.prod(device_size[-i - 2 :])
 
     # Calculate offset by accumulating contribution from each dimension
     offset = 0
-    for di in dim_info_list:
+    for i, di in enumerate(dim_info_list):
         label = di.label
         slice_idx = wk_slice[label]
+
+        tensor_dim_size = device_size[-i - 2]
+        if tensor_dim_size == 1 and di.nsplits > 1:
+            # Explicit broadcast: dimension has size 1 but is split across cores
+            continue
+
         offset += slice_idx * strides[label] // di.nsplits
 
     return offset
@@ -540,6 +569,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"gen_sfp_op: {op=} {dim_labels=} {dim_map=}")
 
     # Obtain (padded) dimensions of the op from a spyre tensor layout
     padded_op_dimensions = [
