@@ -59,7 +59,11 @@ def _compute_per_core_span_bytes(
     device_size = dl.device_size
     dim_map = dl.dim_map
     h = dim_map[0]
-    split = per_host_dim_splits[h] if h >= 0 and dim_map.index(h) == 0 else 1
+    split = (
+        per_host_dim_splits[h]
+        if h >= 0 and h < len(per_host_dim_splits) and dim_map.index(h) == 0
+        else 1
+    )
     per_core_outer_size = device_size[0] // split
     device_stride_0 = math.prod(device_size[1:])
     return per_core_outer_size * device_stride_0 * layout.dtype.itemsize
