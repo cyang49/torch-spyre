@@ -206,9 +206,11 @@ def if_broadcast_get_safe_dims(
             # Not working yet. Need to confirm how to generate sdsc data addresses
             if arg_dim_idx < 0:
                 is_broadcast_dim[out_dim_idx] = True
-                safe_dims[out_dim_idx] = False
-                logger.debug(f"{out_dim_idx=} implicitly broadcasted")
-                return False, None  # skip parallelization for now
+                safe_dims[out_dim_idx] = True
+                continue
+                # safe_dims[out_dim_idx] = False
+                # logger.debug(f"{out_dim_idx=} implicitly broadcasted")
+                # return False, None  # skip parallelization for now
 
             output_size = output.size[out_dim_idx]
             arg_size = arg.layout.size[arg_dim_idx]
@@ -217,9 +219,11 @@ def if_broadcast_get_safe_dims(
                 is_broadcast_dim[out_dim_idx] = True
                 # Explicit broadcast (size 1 -> size N) is now safe to parallelize
                 # because core_idx_to_slice_offset() correctly handles it
-                safe_dims[out_dim_idx] = False
-                logger.debug(f"{out_dim_idx=} explicitly broadcasted")
-                return False, None  # skip parallelization for now
+                safe_dims[out_dim_idx] = True
+                continue
+                # safe_dims[out_dim_idx] = False
+                # logger.debug(f"{out_dim_idx=} explicitly broadcasted")
+                # return False, None  # skip parallelization for now
 
             if arg_size != output_size and arg_size != 1:
                 return False, None
