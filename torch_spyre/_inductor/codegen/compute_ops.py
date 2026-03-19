@@ -706,7 +706,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             size=di.split_size
                                             if (di.scale == 1)
                                             else 1,
-                                            nsplits=di.nsplits,
+                                            nsplits=di.nsplits
+                                            if (di.scale == 1)
+                                            else 1,
                                             elems_per_stick=tensor[
                                                 "device_layout"
                                             ].device_dtype.elems_per_stick(),
@@ -956,7 +958,9 @@ def _generate_matmul_common(
                                             size=di.split_size
                                             if (di.scale == 1)
                                             else 1,
-                                            nsplits=di.nsplits,
+                                            nsplits=di.nsplits
+                                            if (di.scale == 1)
+                                            else 1,
                                             elems_per_stick=tensor[
                                                 "device_layout"
                                             ].device_dtype.elems_per_stick(),
