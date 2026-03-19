@@ -46,36 +46,41 @@ spyreop = torch.ops.spyre
 _CORE_OVERFLOW_LIMIT_BYTES = 256 * 1024 * 1024  # 256 MB hardware limit per core
 
 
-def _tensor_divisor(op_dim_splits: list[int], tensor_op_dims: list[int]) -> int:
-    """Compute the core divisor for a tensor from its participating op dimensions.
-
-    Each tensor dimension maps to one op dimension; the per-core tensor size is
-    total_bytes divided by the product of the splits for those op dimensions.
-
-    Args:
-        op_dim_splits: Split factor per op dimension (e.g. [M_split, K_split, N_split])
-        tensor_op_dims: Indices into op_dim_splits for each tensor dimension
-
-    Returns:
-        Product of the relevant split factors
-    """
-    return math.prod(op_dim_splits[i] for i in tensor_op_dims)
+def _compute_per_core_span_bytes(
+    layout: FixedTiledLayout,
+    per_host_dim_splits: list[int],
+) -> int:
+    # Device tensor is row-major, so the outermost device dimension (dim 0)
+    # has device_stride[0] = prod(device_size[1:]) and dominates the span.
+    # The split is applied to dim 0 only when it is the first (outermost tile)
+    # occurrence of its host dimension in dim_map, which is how get_host_dim_size
+    # resolves the parallelizable size for that host dimension.
+    dl = layout.device_layout
+    device_size = dl.device_size
+    dim_map = dl.dim_map
+    h = dim_map[0]
+    split = per_host_dim_splits[h] if h >= 0 and dim_map.index(h) == 0 else 1
+    per_core_outer_size = device_size[0] // split
+    device_stride_0 = math.prod(device_size[1:])
+    return per_core_outer_size * device_stride_0 * layout.dtype.itemsize
 
 
 def _warn_if_per_core_overflow(
-    tensors: list[tuple[FixedTiledLayout, int]],
+    tensors: list[tuple[FixedTiledLayout, list[int]]],
     op_name: str,
 ) -> None:
-    """Warn if any tensor's per-core slice exceeds the hardware memory limit."""
-    for layout, divisor in tensors:
-        total_bytes = math.prod(layout.size) * layout.dtype.itemsize
-        per_core_bytes = total_bytes // divisor
-        if per_core_bytes > _CORE_OVERFLOW_LIMIT_BYTES:
+    """Warn if any tensor's per-core device memory span exceeds the hardware limit."""
+    for layout, per_host_dim_splits in tensors:
+        span_bytes = _compute_per_core_span_bytes(layout, per_host_dim_splits)
+        if span_bytes > _CORE_OVERFLOW_LIMIT_BYTES:
+            dl = layout.device_layout
             logger.critical(
-                f"{op_name}: per-core tensor size {(per_core_bytes / (1024 * 1024)):.2f} MB "
+                f"{op_name}: per-core tensor span {(span_bytes / (1024 * 1024)):.2f} MB "
                 f"(shape={list(layout.size)}, dtype={layout.dtype}, "
-                f"total={(total_bytes / (1024 * 1024)):.2f} MB, divisor={divisor}) "
-                f"exceeds hardware limit of {(_CORE_OVERFLOW_LIMIT_BYTES / (1024 * 1024)):.2f} MB"
+                f"device_size={list(dl.device_size)}, "
+                f"per_host_dim_splits={per_host_dim_splits}) "
+                f"exceeds hardware limit of "
+                f"{(_CORE_OVERFLOW_LIMIT_BYTES / (1024 * 1024)):.2f} MB"
             )
 
 
@@ -242,8 +247,8 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
                     f"sizes={sizes}, priorities={priorities}, op_dim_splits={n.op_dim_splits}"
                 )
 
-    # All tensors share the same splits, so divisor is n_cores_used for each.
-    tensors = [(output, n.n_cores_used)] + [(a.layout, n.n_cores_used) for a in args]
+    pw_splits = n.op_dim_splits if n.n_cores_used > 1 else [1] * ndim
+    tensors = [(output, pw_splits)] + [(a.layout, pw_splits) for a in args]
     _warn_if_per_core_overflow(tensors, n.node.get_name())
 
     if n.n_cores_used < max_cores:
@@ -291,15 +296,14 @@ def divide_reduction_op(
         else:
             splits = [1, 1, 1]
 
-        # op_dim_splits = [M_split, K_split, N_split]
-        # A [M, K] participates in op dims 0 (M) and 1 (K)
-        # B [K, N] participates in op dims 1 (K) and 2 (N)
-        # Output [M, N] participates in op dims 0 (M) and 2 (N)
+        # A [M, K]: host dims 0=M, 1=K
+        # B [K, N]: host dims 0=K, 1=N
+        # Output [M, N]: host dims 0=M, 1=N
         _warn_if_per_core_overflow(
             [
-                (args[0].layout, _tensor_divisor(splits, [0, 1])),
-                (args[1].layout, _tensor_divisor(splits, [1, 2])),
-                (n.node.get_layout(), _tensor_divisor(splits, [0, 2])),
+                (args[0].layout, [splits[0], splits[1]]),
+                (args[1].layout, [splits[1], splits[2]]),
+                (n.node.get_layout(), [splits[0], splits[2]]),
             ],
             n.node.get_name(),
         )
@@ -341,17 +345,19 @@ def divide_reduction_op(
             else:
                 splits = [1, 1, 1, 1]
 
-            # op_dim_splits = [B_split, M_split, K_split, N_split]
-            # A [B, M, K] participates in op dims 0 (B), 1 (M), 2 (K)
-            # B participates in op dims 2 (K) and 3 (N); additionally op dim 0 (B)
-            # when B is not broadcast (i.e. has 3 dimensions instead of 2)
-            # Output [B, M, N] participates in op dims 0 (B), 1 (M), 3 (N)
-            args1_op_dims = [2, 3] if len(args[1].layout.size) == 2 else [0, 2, 3]
+            # A [B, M, K]: host dims 0=B, 1=M, 2=K
+            # B: [K, N] (broadcast, 2D) or [B, K, N] (3D); host dims as listed
+            # Output [B, M, N]: host dims 0=B, 1=M, 2=N
+            b_splits = (
+                [splits[2], splits[3]]
+                if len(args[1].layout.size) == 2
+                else [splits[0], splits[2], splits[3]]
+            )
             _warn_if_per_core_overflow(
                 [
-                    (args[0].layout, _tensor_divisor(splits, [0, 1, 2])),
-                    (args[1].layout, _tensor_divisor(splits, args1_op_dims)),
-                    (n.node.get_layout(), _tensor_divisor(splits, [0, 1, 3])),
+                    (args[0].layout, [splits[0], splits[1], splits[2]]),
+                    (args[1].layout, b_splits),
+                    (n.node.get_layout(), [splits[0], splits[1], splits[3]]),
                 ],
                 n.node.get_name(),
             )
@@ -388,15 +394,14 @@ def divide_reduction_op(
             else:
                 splits = [1, 1, 1, 1, 1]
 
-            # op_dim_splits = [B1_split, B2_split, M_split, K_split, N_split]
-            # A [B1, B2, M, K] participates in op dims 0 (B1), 1 (B2), 2 (M), 3 (K)
-            # B [B1, B2, K, N] participates in op dims 0 (B1), 1 (B2), 3 (K), 4 (N)
-            # Output [B1, B2, M, N] participates in op dims 0 (B1), 1 (B2), 2 (M), 4 (N)
+            # A [B1, B2, M, K]: host dims 0=B1, 1=B2, 2=M, 3=K
+            # B [B1, B2, K, N]: host dims 0=B1, 1=B2, 2=K, 3=N
+            # Output [B1, B2, M, N]: host dims 0=B1, 1=B2, 2=M, 3=N
             _warn_if_per_core_overflow(
                 [
-                    (args[0].layout, _tensor_divisor(splits, [0, 1, 2, 3])),
-                    (args[1].layout, _tensor_divisor(splits, [0, 1, 3, 4])),
-                    (n.node.get_layout(), _tensor_divisor(splits, [0, 1, 2, 4])),
+                    (args[0].layout, [splits[0], splits[1], splits[2], splits[3]]),
+                    (args[1].layout, [splits[0], splits[1], splits[3], splits[4]]),
+                    (n.node.get_layout(), [splits[0], splits[1], splits[2], splits[4]]),
                 ],
                 n.node.get_name(),
             )
@@ -406,10 +411,12 @@ def divide_reduction_op(
     else:
         # For other reductions (sum, mean, etc.), check overflow without work division
         assert len(args) == 1  # assuming only 1 input tensor
+        ndim_in = len(args[0].layout.size)
+        ndim_out = len(n.node.get_layout().size)
         _warn_if_per_core_overflow(
             [
-                (args[0].layout, n.n_cores_used),
-                (n.node.get_layout(), n.n_cores_used),
+                (args[0].layout, [1] * ndim_in),
+                (n.node.get_layout(), [1] * ndim_out),
             ],
             n.node.get_name(),
         )
