@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from dataclasses import dataclass
 
 
@@ -243,28 +242,38 @@ def calculate_core_to_slice_mapping(
     return core_to_slice
 
 
-# NOTE: dim_info_list only contains operation dimensions that
-#       can map to this tensor. As a result we don't need to
-#       worry about the case when there's a mismatch between
-#       dim_info_list and device size
 def core_idx_to_slice_offset(
     dim_info_list: list[DimInfo],
     wk_slice: dict[str, int],
-    device_size: list[int],
+    tensor: dict,
 ) -> int:
-    # Dims present in the tensor (scale != -1) are in innermost-first order,
-    # matching device_size[-2], device_size[-3], ... positionally.
-    # Broadcast/reduction dims (scale == -1) may appear anywhere and have no device_size slot.
+    # Non-broadcast dims (scale != -1) contribute to the memory offset.
+    # Use get_device_size to look up each dim's size via it_dim_map + dim_map,
+    # which correctly handles broadcast tensors where a size-1 dim occupies a
+    # slot in device_size that would otherwise displace positional indexing.
     tensor_op_infos = [di for di in dim_info_list if di.scale != -1]
 
-    dim_size = {di.label: device_size[-i - 2] for i, di in enumerate(tensor_op_infos)}
-    strides = {
-        di.label: math.prod(device_size[-i - 2 :])
-        for i, di in enumerate(tensor_op_infos)
-    }
+    dl = tensor["device_layout"]
 
-    # Sum offset contributions from each non-broadcast dimension (dims with device_size == 1
-    # and nsplits > 1 are broadcast — all cores read the same single element, so no offset).
+    # Look up each dim's size (in sticks) directly via dim_map, avoiding the positional
+    # device_size[-i-2] indexing that breaks when broadcast dims occupy device_size slots.
+    dim_size = {}
+    for di in tensor_op_infos:
+        host_dim = tensor["it_dim_map"][di.index]
+        device_dim = dl.dim_map.index(host_dim)
+        dim_size[di.label] = dl.device_size[device_dim]
+
+    # Compute strides (in elements) for each dim, innermost first.
+    # Starting from elems_per_stick as base (the implicit innermost device dimension)
+    # mirrors including device_size[-1] in the original formula.
+    strides = {}
+    running = dl.elems_per_stick()
+    for di in tensor_op_infos:
+        running *= dim_size[di.label]
+        strides[di.label] = running
+
+    # Broadcast dims (device_size == 1 with nsplits > 1) are skipped: all cores
+    # read the same single element, so no offset contribution.
     return sum(
         wk_slice[di.label] * strides[di.label] // di.nsplits
         for di in dim_info_list
@@ -674,7 +683,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                     tensor, op
                                                 ),
                                                 core_id_to_wk_slice[str(c)],
-                                                tensor["device_layout"].device_size,
+                                                tensor,
                                             )
                                             * num_bytes(
                                                 tensor["device_layout"].device_dtype
@@ -928,7 +937,7 @@ def _generate_matmul_common(
                                             + core_idx_to_slice_offset(
                                                 dim_infos.get_tensor_infos(tensor, op),
                                                 coreid_to_wk_slice[str(c)],
-                                                tensor["device_layout"].device_size,
+                                                tensor,
                                             )
                                             * num_bytes(
                                                 tensor["device_layout"].device_dtype
