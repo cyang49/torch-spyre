@@ -45,10 +45,10 @@ Pointwise operations perform element-wise computations where each output element
 - Each core processes a contiguous slice of the output tensor
 
 **Broadcast Examples:**
-- `[256] + [256, 256] → [256, 256]`: Can parallelize the second dimension (256), first dimension excluded (broadcast)
-- `[1, 256] + [256, 256] → [256, 256]`: Can parallelize the second dimension (256), first dimension excluded (broadcast from size 1)
+- `[256] + [256, 256] → [256, 256]`: Can parallelize both dimensions; the broadcast input reads the same address on all cores splitting the first dimension
+- `[1, 256] + [256, 256] → [256, 256]`: Can parallelize both dimensions; the broadcast input reads the same address on all cores splitting the first dimension
 - `[256, 256] + [256, 256] → [256, 256]`: Can parallelize both dimensions (no broadcast)
-- `[256, 1] + [256, 256] → [256, 256]`: Can parallelize the first dimension (256), second dimension excluded (broadcast from size 1)
+- `[256, 1] + [256, 256] → [256, 256]`: Can parallelize both dimensions; the broadcast input reads the same address on all cores splitting the second dimension
 
 ### Reduction Operations
 
@@ -119,7 +119,6 @@ The maximum number of cores is configured via an environment variable and valida
 ## Limitations and Considerations
 
 **Current Limitations:**
-- Broadcasting in pointwise operations prevents parallelization
 - Only specific operation types are supported (pointwise, matrix multiplication)
 - Dimensions must divide evenly by the core count
 - No dynamic adjustment based on runtime conditions

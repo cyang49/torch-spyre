@@ -66,9 +66,9 @@ For example, a matrix multiplication might have logical dimensions [M, N] but de
 Pointwise operations are the simplest case for work division. Each core processes a contiguous slice of the output tensor, reading corresponding slices from input tensors.
 
 The code generator:
-1. Determines which dimension is split (currently it's hard-coded as the stick dimension)
-2. Creates a core-to-slice mapping where only the split dimension varies
-3. Calculates memory offsets for each core
+1. Determines which dimensions are split based on the `op_dim_splits` plan
+2. Creates a core-to-slice mapping across all split dimensions
+3. Calculates per-core memory offsets for each tensor, accounting for broadcast dimensions (size 1 in a split dimension) which map to the same address on every core
 4. Generates coordinate information for accessing elements within each slice
 
 All cores use the same computational kernel but operate on different data regions. No synchronization is needed because there are no dependencies between cores.
