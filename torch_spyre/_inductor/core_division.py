@@ -175,53 +175,50 @@ def multi_dim_core_split(
     return splits
 
 
-def if_broadcast_get_safe_dims(
+def is_split_safe_with_shape_mismatch(
     output: FixedTiledLayout, args: list[SchedNodeArg]
-) -> tuple[bool, None | list[bool]]:
+) -> bool:
     """
-    Check if inputs require broadcasting and determine safe dimensions for parallelization.
+    Determine whether work division is safe when args and output have mismatched shapes.
 
-    Returns (False, None) for non-broadcast shape mismatches (e.g., squeeze/view operations).
-    Returns (True, safe_dims) for actual broadcasts, where safe_dims indicates which
-    output dimensions can be safely parallelized.
+    A shape mismatch is safe (returns True) only if it is due to broadcasting:
+    - Implicit broadcast: arg has fewer dimensions than output
+    - Explicit broadcast: arg has size 1 in a dimension where output has size > 1
+
+    Returns False for non-broadcast mismatches (e.g., transposed views), which are
+    unsafe to split because the arg does not correspond element-wise to the output.
 
     Broadcasting aligns dimensions from the right (trailing dimensions).
     """
     ndim = len(output.size)
-    safe_dims = [True] * ndim
-    is_broadcast_dim = [False] * ndim
+    is_broadcast = False
 
     for arg in args:
         arg_ndim = len(arg.layout.size)
 
         if arg_ndim > ndim:
-            return False, None
+            return False
 
         dim_offset = ndim - arg_ndim
 
         for out_dim_idx in range(ndim):
             arg_dim_idx = out_dim_idx - dim_offset
 
-            # Implicit broadcast dimension (input has fewer dims than output)
             if arg_dim_idx < 0:
-                is_broadcast_dim[out_dim_idx] = True
-                safe_dims[out_dim_idx] = True
+                is_broadcast = True  # Implicit broadcast — safe
                 continue
 
             output_size = output.size[out_dim_idx]
             arg_size = arg.layout.size[arg_dim_idx]
 
-            # Explicit broadcast (size 1 -> size N)
             if arg_size == 1 and output_size > 1:
-                is_broadcast_dim[out_dim_idx] = True
-                safe_dims[out_dim_idx] = True
+                is_broadcast = True  # Explicit broadcast — safe
                 continue
 
             if arg_size != output_size:
-                return False, None
+                return False  # Non-broadcast mismatch — unsafe to split
 
-    has_broadcast = any(is_broadcast_dim)
-    return has_broadcast, safe_dims if has_broadcast else None
+    return is_broadcast
 
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
@@ -246,13 +243,13 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     has_shape_mismatch = any(a.layout.size != output.size for a in args)
 
     if has_shape_mismatch:
-        has_broadcast, safe_dims = if_broadcast_get_safe_dims(output, args)
+        is_safe = is_split_safe_with_shape_mismatch(output, args)
 
-        if not has_broadcast:
+        if not is_safe:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     f"pointwise {n.node.get_name()}: disabling parallelization due to "
-                    f"non-broadcast shape mismatch (output.size={output.size}, "
+                    f"unsafe shape mismatch (output.size={output.size}, "
                     f"arg sizes={[a.layout.size for a in args]})"
                 )
             return
@@ -272,19 +269,6 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
     # Use dimension index as base priority (earlier dimensions get higher priority)
     priorities = list(range(ndim, 0, -1))
-
-    if has_shape_mismatch:
-        # We know it's a broadcast at this point - use safe_dims for priority adjustment
-        # Set negative priority for unsafe dimensions to exclude them from splitting
-        for i in range(ndim):
-            assert safe_dims is not None
-            if not safe_dims[i]:
-                priorities[i] = -1
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"pointwise broadcast for {n.node.get_name()}: safe_dims={safe_dims}"
-            )
 
     splits = multi_dim_core_split(sizes, max_cores, priorities)
     n.n_cores_used = math.prod(splits)
