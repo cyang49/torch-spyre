@@ -252,39 +252,24 @@ def core_idx_to_slice_offset(
     wk_slice: dict[str, int],
     device_size: list[int],
 ) -> int:
-    # Verbose logging
-    if logger.isEnabledFor(logging.DEBUG):
-        dim_labels = [di.label for di in dim_info_list]
-        dim_nsplits = [di.nsplits for di in dim_info_list]
-        logger.debug(
-            f"core_idx_to_slice_offset {dim_labels=} {device_size=} {dim_nsplits=} {wk_slice=}"
-        )
+    # Dims present in the tensor (scale != -1) are in innermost-first order,
+    # matching device_size[-2], device_size[-3], ... positionally.
+    # Broadcast/reduction dims (scale == -1) may appear anywhere and have no device_size slot.
+    tensor_op_infos = [di for di in dim_info_list if di.scale != -1]
 
-    ndim = len(device_size) - 1
-    # assertion fails because there is irrelevant dim_info in the list
-    # assert len(dim_info_list) == ndim
-    # ensure only useful info is kept
-    dim_info_list = dim_info_list[:ndim]
+    dim_size = {di.label: device_size[-i - 2] for i, di in enumerate(tensor_op_infos)}
+    strides = {
+        di.label: math.prod(device_size[-i - 2 :])
+        for i, di in enumerate(tensor_op_infos)
+    }
 
-    strides = {}
-    for i, di in enumerate(dim_info_list):
-        # NOTE: dim_info_list is reversed order from least to most significant
-        strides[di.label] = math.prod(device_size[-i - 2 :])
-
-    # Calculate offset by accumulating contribution from each dimension
-    offset = 0
-    for i, di in enumerate(dim_info_list):
-        label = di.label
-        slice_idx = wk_slice[label]
-
-        tensor_dim_size = device_size[-i - 2]
-        if tensor_dim_size == 1 and di.nsplits > 1:
-            # Explicit broadcast: dimension has size 1 but is split across cores
-            continue
-
-        offset += slice_idx * strides[label] // di.nsplits
-
-    return offset
+    # Sum offset contributions from each non-broadcast dimension (dims with device_size == 1
+    # and nsplits > 1 are broadcast — all cores read the same single element, so no offset).
+    return sum(
+        wk_slice[di.label] * strides[di.label] // di.nsplits
+        for di in dim_info_list
+        if di.label in strides and not (dim_size[di.label] == 1 and di.nsplits > 1)
+    )
 
 
 def num_bytes(df: DataFormats) -> int:
