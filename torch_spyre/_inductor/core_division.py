@@ -175,7 +175,7 @@ def multi_dim_core_split(
     return splits
 
 
-def is_split_safe_with_shape_mismatch(
+def can_split_with_shape_mismatch(
     output: FixedTiledLayout, args: list[SchedNodeArg]
 ) -> bool:
     """
@@ -191,7 +191,7 @@ def is_split_safe_with_shape_mismatch(
     Broadcasting aligns dimensions from the right (trailing dimensions).
     """
     ndim = len(output.size)
-    is_broadcast = False
+    can_split = False
 
     for arg in args:
         arg_ndim = len(arg.layout.size)
@@ -205,20 +205,20 @@ def is_split_safe_with_shape_mismatch(
             arg_dim_idx = out_dim_idx - dim_offset
 
             if arg_dim_idx < 0:
-                is_broadcast = True  # Implicit broadcast — safe
+                can_split = True  # Implicit broadcast — safe
                 continue
 
             output_size = output.size[out_dim_idx]
             arg_size = arg.layout.size[arg_dim_idx]
 
             if arg_size == 1 and output_size > 1:
-                is_broadcast = True  # Explicit broadcast — safe
+                can_split = True  # Explicit broadcast — safe
                 continue
 
             if arg_size != output_size:
                 return False  # Non-broadcast mismatch — unsafe to split
 
-    return is_broadcast
+    return can_split
 
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
@@ -243,9 +243,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     has_shape_mismatch = any(a.layout.size != output.size for a in args)
 
     if has_shape_mismatch:
-        is_safe = is_split_safe_with_shape_mismatch(output, args)
-
-        if not is_safe:
+        if not can_split_with_shape_mismatch(output, args):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     f"pointwise {n.node.get_name()}: disabling parallelization due to "
@@ -260,7 +258,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     f"pointwise {n.node.get_name()}: disabling parallelization due to "
-                    f"sparse broadcast (not yet supported)"
+                    f"sparse + shape mismatch (not supported)"
                 )
             return
 
