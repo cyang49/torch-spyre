@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import dataclasses
 import math
 import os
 from sympy import Expr, Symbol
@@ -32,6 +33,8 @@ from torch._inductor.scheduler import (
     NopKernelSchedulerNode,
 )
 
+from torch._inductor.dependencies import MemoryDep
+
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
@@ -41,9 +44,23 @@ import logging
 
 logger = get_inductor_logger("core_division")
 
+# Maximum memory access span per core: 256MB hardware limit
+MAX_SPAN_BYTES = 256 * 1024 * 1024
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
+
+
+@dataclasses.dataclass
+class TensorDep:
+    """Bundles a MemoryDep with its FixedTiledLayout and pre-computes device coordinates."""
+
+    dep: MemoryDep
+    layout: FixedTiledLayout
+    device_coords: list[Expr] = dataclasses.field(init=False)
+
+    def __post_init__(self):
+        self.device_coords = device_coordinates(self.layout, self.dep)
 
 
 def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
@@ -212,33 +229,94 @@ def multi_dim_iteration_space_split(
     return splits
 
 
+def adjust_it_space_for_sticks(
+    it_space: dict[Symbol, Expr],
+    tensor_deps: list[TensorDep],
+) -> None:
+    """Adjust iteration space sizes to count sticks rather than elements.
+
+    For each tensor, find the variable that indexes its stick dimension and
+    convert its size in it_space from elements to sticks. This ensures core
+    division treats sticks as atomic units. Adjusts each variable at most once.
+    """
+    adjusted: set[Symbol] = set()
+    for td in tensor_deps:
+        stick_expr = td.device_coords[-1]
+        if len(stick_expr.free_symbols) != 1:
+            continue
+        stick_var = next(iter(stick_expr.free_symbols))
+        if stick_var in adjusted or stick_var not in it_space:
+            continue
+        elems_per_stick = td.layout.device_layout.elems_per_stick()
+        it_space[stick_var] = (
+            it_space[stick_var] + elems_per_stick - 1
+        ) // elems_per_stick
+        adjusted.add(stick_var)
+
+
+def must_split_vars(
+    tensor_deps: list[TensorDep] | None,
+) -> set[Symbol]:
+    """
+    Return iteration variables that must be split to bring violating tensors'
+    memory span within MAX_SPAN_BYTES.
+
+    For each tensor whose total device memory span exceeds the limit, the free
+    symbol of the outermost device dimension is added to the result — splitting
+    that dimension is the only effective way to reduce contiguous span.
+    """
+    if tensor_deps is None:
+        return set()
+    result: set[Symbol] = set()
+    for td in tensor_deps:
+        dl = td.layout.device_layout
+        bytes_per_elem = 128 // dl.elems_per_stick()
+        span_bytes = math.prod(dl.device_size) * bytes_per_elem
+        if span_bytes <= MAX_SPAN_BYTES:
+            continue
+
+        # Only splitting the outermost dimension reduces memory span. Splitting
+        # inner dimensions gives each core a strided, interleaved subset that
+        # still spans the full address range of the tensor.
+        result.update(td.device_coords[0].free_symbols)
+
+    return result
+
+
 def prioritize_dimensions(
-    coords: list[Expr], iteration_space: dict[Symbol, Expr]
+    output: TensorDep,
+    it_space: dict[Symbol, Expr],
+    inputs: list[TensorDep] | None = None,
 ) -> list[Symbol]:
     """
-    Return a list of the free variables in coords in the order they should be considered for core division.
-    The order combines two considerations:
-      1. If the iteration space is large, prioritize outer dimensions to reduce span-per-core
-      2. After reducing the span, order by size of the dimension to maximize parallelism.
+    Return iteration variables in priority order for core division.
+
+    Priority tiers:
+      1. Must-split vars: outermost dims of tensors that violate MAX_SPAN_BYTES.
+         Splitting these is required to bring memory span within hardware limits.
+      2. Remaining output dims (present in output coords), by decreasing size.
+      3. Reduction dims (absent from output coords), by decreasing size.
     """
-    span = 1
-    for e in iteration_space.values():
-        span *= e
+    coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
-    priority = []
-    # TODO: Don't hardwire this heuristic limit
-    while span > 32 * 1024 * 1024:
-        for e in coords:
-            vars = e.free_symbols
-            for v in vars:
-                if v not in priority:
-                    priority.append(v)
-                    span /= iteration_space[v]
+    all_deps = (inputs + [output]) if inputs is not None else [output]
+    must_split = must_split_vars(all_deps)
+    priority = list(must_split)
 
-    # Prioritize all remaining dimensions by sorting them in decreasing size
-    remaining = [(s, e) for s, e in iteration_space.items() if s not in priority]
-    remaining.sort(key=lambda t: t[1], reverse=True)
-    priority += [t[0] for t in remaining]
+    remaining_output = []
+    reduction_dims = []
+    for s, e in it_space.items():
+        if s in must_split:
+            continue
+        if s in coord_vars:
+            remaining_output.append((s, e))
+        else:
+            reduction_dims.append((s, e))
+
+    remaining_output.sort(key=lambda t: t[1], reverse=True)
+    reduction_dims.sort(key=lambda t: t[1], reverse=True)
+    priority += [t[0] for t in remaining_output]
+    priority += [t[0] for t in reduction_dims]
 
     return priority
 
@@ -248,21 +326,11 @@ def divide_pointwise_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
         return
 
     it_space = iteration_space(n)
-    output_layout: FixedTiledLayout = n.node.get_layout()
-    output_dep = next(iter(n.read_writes.writes))
-    output_dev_coords = device_coordinates(output_layout, output_dep)
-    stick_expr = output_dev_coords[-1]
-    if len(stick_expr.free_symbols) != 1:
-        # TODO: Can codegen handle core division for sparse tensors?
-        return
+    output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 
-    # Adjust the size of the stick dimension iteration space to be in sticks, not elements
-    stick_var = next(iter(stick_expr.free_symbols))
-    elems_per_stick = output_layout.device_layout.elems_per_stick()
-    it_space[stick_var] = (it_space[stick_var] + elems_per_stick - 1) // elems_per_stick
+    adjust_it_space_for_sticks(it_space, [output_td])
 
-    # Do the core division for this operation
-    priorities = prioritize_dimensions(output_dev_coords[:-1], it_space)
+    priorities = prioritize_dimensions(output_td, it_space)
     splits = multi_dim_iteration_space_split(it_space, max_cores, priorities)
 
     cores_used = math.prod(splits.values())
@@ -275,6 +343,36 @@ def divide_pointwise_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
             logger.debug(
                 f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
                 f"iteration_space={it_space}, priorities={priorities}, op_it_space_splits={n.op_it_space_splits}"
+            )
+
+
+def divide_reduction_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
+    if max_cores == 1:
+        return
+
+    red: Reduction = n.node.data
+    if red.reduction_type not in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP):
+        return
+
+    it_space = iteration_space(n)
+    input_tds = [TensorDep(a.dep, a.layout) for a in args]
+    output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
+
+    # Adjust all stick dimension variables (inputs and output) to count sticks
+    adjust_it_space_for_sticks(it_space, input_tds + [output_td])
+
+    priorities = prioritize_dimensions(output_td, it_space, input_tds)
+    splits = multi_dim_iteration_space_split(it_space, max_cores, priorities)
+
+    cores_used = math.prod(splits.values())
+    if cores_used > 1:
+        n.op_it_space_splits = splits
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"reduction work_division {n.node.get_name()}: cores={cores_used}, "
+                f"iteration_space={it_space}, priorities={priorities}, "
+                f"op_it_space_splits={n.op_it_space_splits}"
             )
 
 
@@ -438,6 +536,7 @@ def core_division_planning(
                 divide_pointwise_op_new(n, get_mem_deps(n), max_cores)
             elif isinstance(n.node.data, Reduction):
                 divide_reduction_op(n, get_mem_deps(n), max_cores)
+                divide_reduction_op_new(n, get_mem_deps(n), max_cores)
             else:
                 # Core division not supported on other IRNode types
                 pass
