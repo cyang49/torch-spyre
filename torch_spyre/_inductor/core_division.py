@@ -196,35 +196,56 @@ def multi_dim_iteration_space_split(
     iteration_space: dict[Symbol, Expr],
     max_cores: int,
     priorities: list[Symbol],
+    min_splits: dict[Symbol, int] | None = None,
 ) -> dict[Symbol, int]:
     """
     Distribute max_cores across multiple dimensions of an iteration space.
 
     This function tries to split cores across multiple dimensions to maximize
-    parallelism while ensuring even division. It uses a greedy approach that
-    prioritizes dimensions of the iteration space based on:
-    1. User-specified priorities
-    2. Divisibility (dimensions that divide evenly get priority)
+    parallelism while ensuring even division. It uses a two-pass approach:
+    1. First pass: satisfy minimum split requirements (hardware constraints)
+    2. Second pass: distribute remaining cores by priority
 
     Args:
         iteration_space: The iteration space to be parallelized
         max_cores: Total number of cores available
         priorities: Order in which to consider the dimensions
+        min_splits: Minimum splits required for each dimension (optional)
 
     Returns:
         The core splits for the iteration_space
         The product of all splits will be <= max_cores
     """
-    n_cores_to_split = max_cores
     splits = {v: 1 for v in iteration_space.keys()}
+    n_cores_remaining = max_cores
 
+    # First pass: satisfy minimum split requirements
+    if min_splits:
+        for var, min_split in min_splits.items():
+            # Check if we have enough cores for this minimum split
+            if n_cores_remaining // min_split <= 0:
+                logger.critical(
+                    f"Cannot satisfy minimum split requirement for {var}: "
+                    f"need {min_split} splits but only {n_cores_remaining} cores remaining. "
+                    f"Skipping this constraint - hardware span limit may be violated."
+                )
+                continue  # Skip this variable, leave splits[var] = 1
+
+            # Safe to apply the minimum split
+            splits[var] = min_split
+            n_cores_remaining = n_cores_remaining // min_split
+
+    # Second pass: distribute remaining cores by priority
     for v in priorities:
-        if n_cores_to_split <= 1:
+        if n_cores_remaining <= 1:
             break
-        best_split = core_split(iteration_space[v], n_cores_to_split)
+        if min_splits and v in min_splits:
+            continue  # Already handled in first pass
+
+        best_split = core_split(iteration_space[v], n_cores_remaining)
         if best_split > 1:
             splits[v] = best_split
-            n_cores_to_split = n_cores_to_split // best_split
+            n_cores_remaining = n_cores_remaining // best_split
 
     return splits
 
@@ -256,18 +277,23 @@ def adjust_it_space_for_sticks(
 
 def must_split_vars(
     tensor_deps: list[TensorDep] | None,
-) -> set[Symbol]:
+) -> dict[Symbol, int]:
     """
     Return iteration variables that must be split to bring violating tensors'
-    memory span within MAX_SPAN_BYTES.
+    memory span within MAX_SPAN_BYTES, along with the minimum number of splits
+    required.
 
-    For each tensor whose total device memory span exceeds the limit, the free
-    symbol of the outermost device dimension is added to the result — splitting
-    that dimension is the only effective way to reduce contiguous span.
+    For each tensor whose total device memory span exceeds the limit, find the
+    first non-size-1 outer dimension that can be split. Since device layout is
+    always row-major, splitting outer dimensions reduces contiguous memory span.
+
+    Returns:
+        dict mapping Symbol -> minimum number of splits required to satisfy
+        the hardware span constraint.
     """
     if tensor_deps is None:
-        return set()
-    result: set[Symbol] = set()
+        return {}
+    result: dict[Symbol, int] = {}
     for td in tensor_deps:
         dl = td.layout.device_layout
         bytes_per_elem = 128 // dl.elems_per_stick()
@@ -275,10 +301,19 @@ def must_split_vars(
         if span_bytes <= MAX_SPAN_BYTES:
             continue
 
-        # Only splitting the outermost dimension reduces memory span. Splitting
-        # inner dimensions gives each core a strided, interleaved subset that
-        # still spans the full address range of the tensor.
-        result.update(td.device_coords[0].free_symbols)
+        # Calculate minimum splits needed to bring span within limit
+        min_splits = math.ceil(span_bytes / MAX_SPAN_BYTES)
+
+        # Find the first splittable outer dimension (non-size-1).
+        # Device layout is row-major, so outer dimensions have larger strides
+        # and splitting them effectively reduces contiguous memory span.
+        for i, coord in enumerate(td.device_coords[:-1]):  # exclude stick dim
+            dim_size = dl.device_size[i]
+            if dim_size > 1:  # splittable dimension
+                for var in coord.free_symbols:
+                    # If multiple tensors require splits on same var, use max
+                    result[var] = max(result.get(var, 1), min_splits)
+                break
 
     return result
 
@@ -287,26 +322,30 @@ def prioritize_dimensions(
     output: TensorDep,
     it_space: dict[Symbol, Expr],
     inputs: list[TensorDep] | None = None,
-) -> list[Symbol]:
+) -> tuple[list[Symbol], dict[Symbol, int]]:
     """
-    Return iteration variables in priority order for core division.
+    Return iteration variables in priority order for core division, along with
+    minimum split requirements.
 
     Priority tiers:
       1. Must-split vars: outermost dims of tensors that violate MAX_SPAN_BYTES.
          Splitting these is required to bring memory span within hardware limits.
       2. Remaining output dims (present in output coords), by decreasing size.
       3. Reduction dims (absent from output coords), by decreasing size.
+
+    Returns:
+        tuple of (priority list, min_splits dict)
     """
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
     all_deps = (inputs + [output]) if inputs is not None else [output]
-    must_split = must_split_vars(all_deps)
-    priority = list(must_split)
+    min_splits = must_split_vars(all_deps)
+    priority = list(min_splits.keys())
 
     remaining_output = []
     reduction_dims = []
     for s, e in it_space.items():
-        if s in must_split:
+        if s in min_splits:
             continue
         if s in coord_vars:
             remaining_output.append((s, e))
@@ -318,7 +357,7 @@ def prioritize_dimensions(
     priority += [t[0] for t in remaining_output]
     priority += [t[0] for t in reduction_dims]
 
-    return priority
+    return priority, min_splits
 
 
 def divide_pointwise_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
@@ -330,8 +369,10 @@ def divide_pointwise_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
 
     adjust_it_space_for_sticks(it_space, [output_td])
 
-    priorities = prioritize_dimensions(output_td, it_space)
-    splits = multi_dim_iteration_space_split(it_space, max_cores, priorities)
+    priorities, min_splits = prioritize_dimensions(output_td, it_space)
+    splits = multi_dim_iteration_space_split(
+        it_space, max_cores, priorities, min_splits
+    )
 
     cores_used = math.prod(splits.values())
 
@@ -342,7 +383,8 @@ def divide_pointwise_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
-                f"iteration_space={it_space}, priorities={priorities}, op_it_space_splits={n.op_it_space_splits}"
+                f"iteration_space={it_space}, priorities={priorities}, "
+                f"min_splits={min_splits}, op_it_space_splits={n.op_it_space_splits}"
             )
 
 
@@ -361,8 +403,10 @@ def divide_reduction_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
     # Adjust all stick dimension variables (inputs and output) to count sticks
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
-    priorities = prioritize_dimensions(output_td, it_space, input_tds)
-    splits = multi_dim_iteration_space_split(it_space, max_cores, priorities)
+    priorities, min_splits = prioritize_dimensions(output_td, it_space, input_tds)
+    splits = multi_dim_iteration_space_split(
+        it_space, max_cores, priorities, min_splits
+    )
 
     cores_used = math.prod(splits.values())
     if cores_used > 1:
@@ -372,7 +416,7 @@ def divide_reduction_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
             logger.debug(
                 f"reduction work_division {n.node.get_name()}: cores={cores_used}, "
                 f"iteration_space={it_space}, priorities={priorities}, "
-                f"op_it_space_splits={n.op_it_space_splits}"
+                f"min_splits={min_splits}, op_it_space_splits={n.op_it_space_splits}"
             )
 
 
