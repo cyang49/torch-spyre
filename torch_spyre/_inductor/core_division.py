@@ -261,19 +261,26 @@ def adjust_it_space_for_sticks(
     convert its size in it_space from elements to sticks. This ensures core
     division treats sticks as atomic units. Adjusts each variable at most once.
     """
-    adjusted: set[Symbol] = set()
+    adjusted: dict[Symbol, int] = {}  # stick_var -> elems_per_stick used
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
             continue
         stick_var = next(iter(stick_expr.free_symbols))
-        if stick_var in adjusted or stick_var not in it_space:
+        if stick_var not in it_space:
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
+        if stick_var in adjusted:
+            assert adjusted[stick_var] == elems_per_stick, (
+                f"Conflicting elems_per_stick for iteration variable {stick_var}: "
+                f"previously seen {adjusted[stick_var]}, now {elems_per_stick}. "
+                f"Mixed-dtype tensors sharing a stick variable are not supported."
+            )
+            continue
         it_space[stick_var] = (
             it_space[stick_var] + elems_per_stick - 1
         ) // elems_per_stick
-        adjusted.add(stick_var)
+        adjusted[stick_var] = elems_per_stick
 
 
 def must_split_vars(
