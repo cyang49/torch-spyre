@@ -413,12 +413,16 @@ def divide_pointwise_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
     cores_used = math.prod(splits.values())
 
     if cores_used > 1:
+        # TODO: set n.n_cores_used = cores_used when old path is retired
+        logger.warning(
+            f"pointwise work_division {n.node.get_name()}: new path "
+            f"cores={cores_used}, old path n_cores_used={n.n_cores_used}"
+        )
         n.op_it_space_splits = splits
 
-        # Consolidated DEBUG log for pointwise work division
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
+                f"pointwise work_division {n.node.get_name()}: cores={cores_used}, "
                 f"iteration_space={it_space}, priorities={priorities}, "
                 f"min_splits={min_splits}, op_it_space_splits={n.op_it_space_splits}"
             )
@@ -446,7 +450,11 @@ def divide_reduction_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
 
     cores_used = math.prod(splits.values())
     if cores_used > 1:
-        n.n_cores_used = cores_used
+        # TODO: set n.n_cores_used = cores_used when old path is retired
+        logger.warning(
+            f"reduction work_division {n.node.get_name()}: new path "
+            f"cores={cores_used}, old path n_cores_used={n.n_cores_used}"
+        )
         n.op_it_space_splits = splits
 
         if logger.isEnabledFor(logging.DEBUG):
