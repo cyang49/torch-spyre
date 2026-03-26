@@ -362,6 +362,9 @@ def prioritize_dimensions(
     Returns:
         tuple of (priority list, min_splits dict)
     """
+    # Collect free symbols from all output device coords except the stick dim.
+    # The stick dim is always the innermost device dimension and shares its host
+    # dimension with an outer coord, so its free symbol is already captured here.
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
     all_deps = (inputs + [output]) if inputs is not None else [output]
