@@ -46,6 +46,7 @@ logger = get_inductor_logger("core_division")
 
 # Maximum memory access span per core: 256MB hardware limit
 MAX_SPAN_BYTES = 256 * 1024 * 1024
+MAX_SPAN_STICKS = MAX_SPAN_BYTES // 128
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
@@ -287,22 +288,24 @@ def must_split_vars(
     first non-size-1 outer dimension that can be split. Since device layout is
     always row-major, splitting outer dimensions reduces contiguous memory span.
 
+    Span is measured in sticks (128 bytes each). The minimum split is rounded
+    up to the nearest divisor of the dimension size so each core gets an equal
+    integer-sized slice.
+
     Returns:
         dict mapping Symbol -> minimum number of splits required to satisfy
-        the hardware span constraint.
+        the hardware span constraint, guaranteed to evenly divide the dimension.
     """
     if tensor_deps is None:
         return {}
     result: dict[Symbol, int] = {}
     for td in tensor_deps:
         dl = td.layout.device_layout
-        bytes_per_elem = 128 // dl.elems_per_stick()
-        span_bytes = math.prod(dl.device_size) * bytes_per_elem
-        if span_bytes <= MAX_SPAN_BYTES:
+        # device_size[-1] is elements per stick (fixed by dtype); all other
+        # dims count sticks, so the total stick count excludes the last dim
+        total_sticks = math.prod(dl.device_size[:-1])
+        if total_sticks <= MAX_SPAN_STICKS:
             continue
-
-        # Calculate minimum splits needed to bring span within limit
-        min_splits = math.ceil(span_bytes / MAX_SPAN_BYTES)
 
         # Find the first splittable outer dimension (non-size-1).
         # Device layout is row-major, so outer dimensions have larger strides
@@ -310,9 +313,32 @@ def must_split_vars(
         for i, coord in enumerate(td.device_coords[:-1]):  # exclude stick dim
             dim_size = dl.device_size[i]
             if dim_size > 1:  # splittable dimension
+                assert coord.free_symbols, (
+                    f"Device dimension {i} has size {dim_size} > 1 but its "
+                    f"coordinate expression has no free symbols: {coord!r}. "
+                    f"Cannot determine which iteration variable to split."
+                )
+                # Minimum splits so that sticks-per-core <= MAX_SPAN_STICKS.
+                # Round up to the nearest divisor of dim_size so each core
+                # gets an equal, integer-sized slice.
+                min_split_raw = math.ceil(total_sticks / MAX_SPAN_STICKS)
+                min_split = next(
+                    (
+                        d
+                        for d in range(min_split_raw, dim_size + 1)
+                        if dim_size % d == 0
+                    ),
+                    dim_size,  # fallback: split fully; best effort if dim is prime
+                )
+                if min_split == dim_size and dim_size < min_split_raw:
+                    logger.warning(
+                        f"Cannot fully satisfy span limit for dimension {i} "
+                        f"(size={dim_size}, need {min_split_raw} splits): "
+                        f"using full split of {dim_size}."
+                    )
                 for var in coord.free_symbols:
                     # If multiple tensors require splits on same var, use max
-                    result[var] = max(result.get(var, 1), min_splits)
+                    result[var] = max(result.get(var, 1), min_split)
                 break
 
     return result
@@ -410,6 +436,7 @@ def divide_reduction_op_new(n: SchedulerNode, args: list[SchedNodeArg], max_core
 
     cores_used = math.prod(splits.values())
     if cores_used > 1:
+        n.n_cores_used = cores_used
         n.op_it_space_splits = splits
 
         if logger.isEnabledFor(logging.DEBUG):
