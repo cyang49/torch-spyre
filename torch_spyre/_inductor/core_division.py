@@ -175,70 +175,52 @@ def must_split_vars(
     tensor_deps: list[TensorDep] | None,
     it_space_adjusted: dict[Symbol, Expr],
 ) -> dict[Symbol, int]:
-    """
-    Return iteration variables that must be split to bring violating tensors'
-    memory span within MAX_SPAN_BYTES, along with the minimum number of splits
-    required.
+    """Return the minimum splits required per iteration variable to keep each
+    tensor's memory span within MAX_SPAN_STICKS.
 
-    For each tensor whose total device memory span exceeds the limit, find the
-    first non-size-1 outer dimension that can be split. Since device layout is
-    always row-major, splitting outer dimensions reduces contiguous memory span.
+    For each violating tensor, finds the outermost non-size-1 device dimension
+    (row-major layout means outer dims have larger strides and splitting them
+    reduces contiguous span). The minimum split is rounded up to the nearest
+    divisor of the stick-adjusted iteration space size so each core gets an
+    equal integer-sized slice.
 
-    Span is measured in sticks (128 bytes each). The minimum split is rounded
-    up to the nearest divisor of the dimension size so each core gets an equal
-    integer-sized slice.
-
-    Returns:
-        dict mapping Symbol -> minimum number of splits required to satisfy
-        the hardware span constraint, guaranteed to evenly divide the dimension.
+    Returns a dict mapping Symbol -> minimum split count, guaranteed to evenly
+    divide the corresponding entry in it_space_adjusted.
     """
     if tensor_deps is None:
         return {}
     result: dict[Symbol, int] = {}
     for td in tensor_deps:
-        dl = td.layout.device_layout
-        # device_size[-1] is elements per stick (fixed by dtype); all other
-        # dims count sticks, so the total stick count excludes the last dim
-        total_sticks = math.prod(dl.device_size[:-1])
+        total_sticks = math.prod(td.layout.device_layout.device_size[:-1])
         if total_sticks <= MAX_SPAN_STICKS:
             continue
 
-        # Find the first splittable outer dimension (non-size-1).
-        # Device layout is row-major, so outer dimensions have larger strides
-        # and splitting them effectively reduces contiguous memory span.
-        for i, coord in enumerate(td.device_coords[:-1]):  # exclude stick dim
-            dim_size = dl.device_size[i]
-            if dim_size > 1:  # splittable dimension
-                assert coord.free_symbols, (
-                    f"Device dimension {i} has size {dim_size} > 1 but its "
-                    f"coordinate expression has no free symbols: {coord!r}. "
-                    f"Cannot determine which iteration variable to split."
+        for coord in td.device_coords[:-1]:
+            vars_ = coord.free_symbols
+            assert len(vars_) == 1, (
+                f"Expected exactly 1 free symbol in device coord {coord!r}, got {vars_}."
+            )
+            adjusted_size = it_space_adjusted[next(iter(vars_))]
+            if adjusted_size == 1:
+                continue
+            min_split_raw = math.ceil(total_sticks / MAX_SPAN_STICKS)
+            min_split = next(
+                (
+                    d
+                    for d in range(min_split_raw, adjusted_size + 1)
+                    if adjusted_size % d == 0
+                ),
+                adjusted_size,
+            )
+            if min_split == adjusted_size and adjusted_size < min_split_raw:
+                logger.warning(
+                    f"Cannot fully satisfy span limit for {vars_} "
+                    f"(adjusted_size={adjusted_size}, need {min_split_raw} splits): "
+                    f"using full split of {adjusted_size}."
                 )
-                # Minimum splits so that sticks-per-core <= MAX_SPAN_STICKS.
-                # Round up to the nearest divisor of dim_size so each core
-                # gets an equal, integer-sized slice.
-                min_split_raw = math.ceil(total_sticks / MAX_SPAN_STICKS)
-                adjusted_size = it_space_adjusted.get(
-                    next(iter(coord.free_symbols)), dim_size
-                )
-                min_split = next(
-                    (
-                        d
-                        for d in range(min_split_raw, adjusted_size + 1)
-                        if adjusted_size % d == 0
-                    ),
-                    adjusted_size,  # fallback: split fully; best effort if dim is prime
-                )
-                if min_split == adjusted_size and adjusted_size < min_split_raw:
-                    logger.warning(
-                        f"Cannot fully satisfy span limit for dimension {i} "
-                        f"(size={adjusted_size}, need {min_split_raw} splits): "
-                        f"using full split of {adjusted_size}."
-                    )
-                for var in coord.free_symbols:
-                    # If multiple tensors require splits on same var, use max
-                    result[var] = max(result.get(var, 1), min_split)
-                break
+            for var in vars_:
+                result[var] = max(result.get(var, 1), min_split)
+            break
 
     return result
 
@@ -271,14 +253,16 @@ def prioritize_dimensions(
     priority = list(min_splits.keys())
 
     remaining_output = []
-    reduction_dims = []
+    reduction_dims: list[tuple[Symbol, Expr]] = []
     for s, e in it_space.items():
         if s in min_splits:
             continue
         if s in coord_vars:
             remaining_output.append((s, e))
         else:
-            reduction_dims.append((s, e))
+            # NOTE: skip reduction dims for now for known backend bug
+            # reduction_dims.append((s, e))
+            pass
 
     remaining_output.sort(key=lambda t: t[1], reverse=True)
     reduction_dims.sort(key=lambda t: t[1], reverse=True)
