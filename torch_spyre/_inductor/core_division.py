@@ -119,6 +119,8 @@ def multi_dim_iteration_space_split(
     # First pass: satisfy minimum split requirements
     if min_splits:
         for var, min_split in min_splits.items():
+            assert var not in priorities  # there shouldn't be an overlap
+
             # Check if we have enough cores for this minimum split
             if n_cores_remaining // min_split <= 0:
                 logger.critical(
@@ -136,8 +138,6 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-        if min_splits and v in min_splits:
-            continue  # Already handled in first pass
 
         best_split = core_split(iteration_space[v], n_cores_remaining, min_slice)
         if best_split > 1:
@@ -259,9 +259,10 @@ def prioritize_dimensions(
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
     all_deps = (inputs + [output]) if inputs is not None else [output]
+    # NOTE: it is possible that a reduction var is selected as must split
     min_splits = must_split_vars(all_deps, it_space)
-    priority = list(min_splits.keys())
 
+    priority = []
     remaining_output = []
     reduction_dims: list[tuple[Symbol, Expr]] = []
     for s, e in it_space.items():
