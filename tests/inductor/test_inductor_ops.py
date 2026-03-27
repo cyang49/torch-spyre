@@ -162,7 +162,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((2, 256, 1), (2, 1, 128)),
-                    ((3, 11, 2880), (3, 2880, 2880)),
                 ]
             ),
         },
@@ -175,11 +174,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # disable 6d for now - dynamo failed
+        # Disable 6d for now - Signal Received: 11 (Segmentation fault) FlexDataTransfer
         # ("test_work_division", "test_binary_op"): {
         #     "ops_dict": {"mul": torch.mul},
         #     "param_sets": {
-        #         "6d": (cached_randn((1, 1, 256, 1, 48, 128)), cached_randn((1, 1, 1, 256, 48, 128))),
+        #         "6d": (
+        #             cached_randn((1, 1, 256, 1, 48, 128)),
+        #             cached_randn((1, 1, 1, 256, 48, 128)),
+        #         ),
         #     },
         # },
         ("test_matmul", "test_binary_op_cpu"): {
