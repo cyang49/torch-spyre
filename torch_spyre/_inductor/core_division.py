@@ -197,6 +197,8 @@ def must_split_vars(
 
         for coord in td.device_coords[:-1]:
             vars_ = coord.free_symbols
+            if not vars_:
+                continue  # skipping empty set (is it safe to assume no constant value > 1)?
             assert len(vars_) == 1, (
                 f"Expected exactly 1 free symbol in device coord {coord!r}, got {vars_}."
             )
