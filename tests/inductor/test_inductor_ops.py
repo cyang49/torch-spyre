@@ -167,16 +167,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ),
         },
         ("test_work_division", "test_mm_relaxed"): {
-            "ops_dict": {"bmm": torch.bmm},
+            "ops_dict": {"matmul": torch.matmul},
             "param_sets": {
                 "3d": (
                     cached_randn((3, 11, 2880), scale=0.1),
                     cached_randn((3, 2880, 2880), scale=0.1),
                 ),
-                # disable 6d for now - dynamo failed
-                # "6d": (cached_randn((1, 1, 256, 1, 48, 128), scale=0.1), cached_randn((1, 1, 1, 256, 48, 128), scale=0.1)),
             },
         },
+        # disable 6d for now - dynamo failed
+        # ("test_work_division", "test_binary_op"): {
+        #     "ops_dict": {"mul": torch.mul},
+        #     "param_sets": {
+        #         "6d": (cached_randn((1, 1, 256, 1, 48, 128)), cached_randn((1, 1, 1, 256, 48, 128))),
+        #     },
+        # },
         ("test_matmul", "test_binary_op_cpu"): {
             "ops_dict": {
                 "matmul": torch.matmul,
