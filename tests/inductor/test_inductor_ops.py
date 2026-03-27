@@ -162,8 +162,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((2, 256, 1), (2, 1, 128)),
+                    ((3, 11, 2880), (3, 2880, 2880)),
                 ]
             ),
+        },
+        ("test_work_division", "test_mm_relaxed"): {
+            "ops_dict": {"bmm": torch.bmm},
+            "param_sets": {
+                "3d": (
+                    cached_randn((3, 11, 2880), scale=0.1),
+                    cached_randn((3, 2880, 2880), scale=0.1),
+                ),
+                # disable 6d for now - dynamo failed
+                # "6d": (cached_randn((1, 1, 256, 1, 48, 128), scale=0.1), cached_randn((1, 1, 1, 256, 48, 128), scale=0.1)),
+            },
         },
         ("test_matmul", "test_binary_op_cpu"): {
             "ops_dict": {
