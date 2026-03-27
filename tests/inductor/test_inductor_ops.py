@@ -186,28 +186,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        # TODO: add back work division for large tensor tests in a follow up PR
-        # NOTE: placing large tensor test after matmul test seems to prevent
-        #       disrupting matmul tests
-        # ("test_work_division", "test_mm_relaxed"): {
-        #     "ops_dict": {"matmul": torch.matmul},
-        #     "param_sets": {
-        #         "3d": (
-        #             cached_randn((3, 11, 2880), scale=0.1),
-        #             cached_randn((3, 2880, 2880), scale=0.1),
-        #         ),
-        #     },
-        # },
-        # Disable 6d for now - Signal Received: 11 (Segmentation fault) FlexDataTransfer
-        # ("test_work_division", "test_binary_op"): {
-        #     "ops_dict": {"mul": torch.mul},
-        #     "param_sets": {
-        #         "6d": (
-        #             cached_randn((1, 1, 256, 1, 48, 128)),
-        #             cached_randn((1, 1, 1, 256, 48, 128)),
-        #         ),
-        #     },
-        # },
         ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": {"sum": torch.sum},
             "param_sets": {
