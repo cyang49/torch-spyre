@@ -265,9 +265,7 @@ def prioritize_dimensions(
         if s in coord_vars:
             remaining_output.append((s, e))
         else:
-            # NOTE: skip reduction dims for now for known backend bug
-            # reduction_dims.append((s, e))
-            pass
+            reduction_dims.append((s, e))
 
     remaining_output.sort(key=lambda t: t[1], reverse=True)
     reduction_dims.sort(key=lambda t: t[1], reverse=True)
