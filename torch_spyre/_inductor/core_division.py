@@ -164,6 +164,9 @@ def adjust_it_space_for_sticks(
                 f"Mixed-dtype tensors sharing a stick variable are not supported."
             )
             continue
+        # FIXME: here we assume padding to a full stick. It may not always be the
+        #        case and we shouldn use a more robust way of computing the number
+        #        of sticks
         it_space[stick_var] = (
             it_space[stick_var] + elems_per_stick - 1
         ) // elems_per_stick
