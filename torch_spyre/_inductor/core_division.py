@@ -257,7 +257,7 @@ def prioritize_dimensions(
     remaining_output = []
     reduction_dims: list[tuple[Symbol, Expr]] = []
     for s, e in it_space.items():
-        if s in min_splits.keys():
+        if s in min_splits:
             continue
         if s in coord_vars:
             remaining_output.append((s, e))
