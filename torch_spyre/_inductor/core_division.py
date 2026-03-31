@@ -327,6 +327,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
     # FIXME: For non-matmul reduction, excluting reduction dimensions from work
     #        division candidates temporarily till known backend issue is fixed
+    #        https://github.com/torch-spyre/torch-spyre/issues/1304
     priorities, min_splits = prioritize_dimensions(
         output_td, it_space, input_tds, exclude_reduction=not is_matmul
     )
