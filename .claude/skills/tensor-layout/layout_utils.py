@@ -4,6 +4,9 @@
 # Reproduces the logic from torch_spyre/csrc/spyre_tensor_impl.cpp without
 # requiring a Spyre build. Useful for offline debugging of layout issues.
 #
+# The public API uses device_size and stride_map — not dim_map, which is an
+# internal C++ implementation detail being deprecated from Python-layer reasoning.
+#
 # Usage:
 #   python3 layout_utils.py --shape 2880 90 44 64 --dtype fp16
 #   python3 layout_utils.py --shape 512 256 --dtype fp16 --dim_order 1 0
@@ -18,56 +21,48 @@ BYTES_PER_STICK = 128
 
 
 # ---------------------------------------------------------------------------
-# Core layout computation (mirrors spyre_tensor_impl.cpp)
+# Internal helpers (mirror spyre_tensor_impl.cpp; dim_map is internal only)
 # ---------------------------------------------------------------------------
 
 
-def get_generic_stick_layout(dim_order: list[int]) -> list[int]:
-    """Reproduce get_generic_stick_layout from spyre_tensor_impl.cpp:46-80.
+def _get_generic_stick_layout(dim_order: list[int]) -> list[int]:
+    """Internal: reproduce get_generic_stick_layout from spyre_tensor_impl.cpp:46-80.
 
-    Given a host dim_order (e.g. [0,1,2,3] for default), returns dim_map.
-    Pattern for rank N: [dim1, dim2, ..., dimN, dim0, dimN]
+    Returns the internal dim_map used to compute device_size and stride_map.
+    Not part of the public API — use make_layout() instead.
     """
     rank = len(dim_order)
     if rank == 0:
         return [-1, -1]
     if rank == 1:
         return [dim_order[0], dim_order[0]]
-    # General pattern: [dim_order[1], ..., dim_order[N-1], dim_order[0], dim_order[N-1]]
-    # Exception: if dim_order ends in -1 (sparse), keep -1 at the end as-is.
     sparse = dim_order[-1] == -1
     if sparse:
         inner = dim_order[:-1]
-        result = inner[1:] + [inner[0]] + [-1]
-    else:
-        result = dim_order[1:] + [dim_order[0]] + [dim_order[-1]]
-    return result
+        return inner[1:] + [inner[0]] + [-1]
+    return dim_order[1:] + [dim_order[0]] + [dim_order[-1]]
 
 
-def compute_device_size(
+def _compute_device_size(
     host_size: list[int], dim_map: list[int], elems_per_stick: int
 ) -> list[int]:
-    """Reproduce device_size computation from spyre_tensor_impl.cpp:169-191."""
+    """Internal: reproduce device_size computation from spyre_tensor_impl.cpp:169-191."""
     stick_dim = dim_map[-1]
     device_size = [0] * len(dim_map)
     device_size[-1] = elems_per_stick
     sparse = stick_dim == -1
-    elems_in_stick = 1 if sparse else elems_per_stick
     for i in range(len(dim_map) - 1):
         d = dim_map[i]
         if d == -1:
             device_size[i] = 1
         elif d == stick_dim:
-            if sparse:
-                device_size[i] = 1
-            else:
-                device_size[i] = math.ceil(host_size[stick_dim] / elems_in_stick)
+            device_size[i] = 1 if sparse else math.ceil(host_size[d] / elems_per_stick)
         else:
             device_size[i] = host_size[d]
     return device_size
 
 
-def compute_host_stride(host_size: list[int]) -> list[int]:
+def _compute_host_stride(host_size: list[int]) -> list[int]:
     n = len(host_size)
     stride = [1] * n
     for i in range(n - 2, -1, -1):
@@ -75,13 +70,17 @@ def compute_host_stride(host_size: list[int]) -> list[int]:
     return stride
 
 
-def compute_stride_map(
+def _compute_stride_map(
     dim_map: list[int],
     host_size: list[int],
     host_stride: list[int],
     device_size: list[int],
 ) -> list[int]:
-    """Reproduce dim_map_to_stride_map from spyre_tensor_impl.cpp:111-131."""
+    """Internal: reproduce dim_map_to_stride_map from spyre_tensor_impl.cpp:111-131.
+
+    stride_map[j] = the host stride for device dimension j.
+    -1 means this device dim is unused (synthetic or size-1 host dim).
+    """
     n = len(dim_map)
     stride_map = [-1] * n
     last_stride: dict[int, int] = {}
@@ -98,8 +97,8 @@ def compute_stride_map(
     return stride_map
 
 
-def compute_device_stride(device_size: list[int]) -> list[int]:
-    """Row-major strides from device_size (standard implicit stride formula)."""
+def _compute_device_stride(device_size: list[int]) -> list[int]:
+    """Row-major implicit strides from device_size."""
     n = len(device_size)
     stride = [1] * n
     for i in range(n - 2, -1, -1):
@@ -108,24 +107,25 @@ def compute_device_stride(device_size: list[int]) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# High-level layout descriptor
+# Public layout descriptor
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class SpyreLayout:
+    """Offline representation of a SpyreTensorLayout.
+
+    Fields mirror what Python code uses: device_size, stride_map, device_stride.
+    dim_map is intentionally not exposed — it is deprecated for Python-layer reasoning.
+    """
+
     host_size: list[int]
     host_stride: list[int]
-    dim_map: list[int]
     device_size: list[int]
     stride_map: list[int]
     device_stride: list[int]
     elems_per_stick: int
     dtype: str
-
-    @property
-    def stick_dim(self) -> int:
-        return self.dim_map[-1]
 
     @property
     def total_bytes(self) -> int:
@@ -136,25 +136,20 @@ class SpyreLayout:
         print(f"Host stride:    {self.host_stride}")
         print(f"dtype:          {self.dtype}  (elems_per_stick={self.elems_per_stick})")
         print()
-        print(f"dim_map:        {self.dim_map}")
-        print("  → device dim → host dim mapping")
-        for i, d in enumerate(self.dim_map):
-            label = "(stick)" if i == len(self.dim_map) - 1 else ""
-            host_label = f"host[{d}]={self.host_size[d]}" if d >= 0 else "synthetic(-1)"
-            print(f"    dev[{i}]: {host_label}  {label}")
-        print()
         print(f"device_size:    {self.device_size}")
         print(f"device_stride:  {self.device_stride}")
         print(f"stride_map:     {self.stride_map}")
-        print("  → host stride each device dim indexes with")
-        for i, (sm, dm) in enumerate(zip(self.stride_map, self.device_size)):
-            label = "(stick)" if i == len(self.dim_map) - 1 else ""
-            print(f"    dev[{i}] size={dm}, stride_map={sm}  {label}")
+        print(
+            "  → stride_map[i] = host stride per unit advance in device dim i (-1 = unused)"
+        )
+        for i, (sm, ds) in enumerate(zip(self.stride_map, self.device_size)):
+            label = "(stick)" if i == len(self.device_size) - 1 else ""
+            active = f"host stride {sm}" if sm >= 0 else "unused"
+            print(f"    dev[{i}] size={ds}, {active}  {label}")
         print()
         print(f"Total device bytes: {self.total_bytes:,}")
-        host_bytes = math.prod(self.host_size) * (
-            BYTES_PER_STICK // self.elems_per_stick
-        )
+        word_bytes = BYTES_PER_STICK // self.elems_per_stick
+        host_bytes = math.prod(self.host_size) * word_bytes
         print(f"Total host bytes:   {host_bytes:,}")
         if self.total_bytes == host_bytes:
             print("  ✓ sizes match")
@@ -168,7 +163,7 @@ def make_layout(
     dim_order: list[int] | None = None,
     host_stride: list[int] | None = None,
 ) -> SpyreLayout:
-    """Compute the full SpyreLayout for a host tensor.
+    """Compute the SpyreLayout (device_size, stride_map) for a host tensor.
 
     dim_order: custom host dim ordering (default: [0, 1, ..., N-1]).
     host_stride: custom host strides (default: row-major).
@@ -177,17 +172,17 @@ def make_layout(
     if dim_order is None:
         dim_order = list(range(len(host_size)))
     if host_stride is None:
-        host_stride = compute_host_stride(host_size)
+        host_stride = _compute_host_stride(host_size)
 
-    dim_map = get_generic_stick_layout(dim_order)
-    device_size = compute_device_size(host_size, dim_map, eps)
-    stride_map = compute_stride_map(dim_map, host_size, host_stride, device_size)
-    device_stride = compute_device_stride(device_size)
+    # dim_map is internal — used only to compute device_size and stride_map
+    dim_map = _get_generic_stick_layout(dim_order)
+    device_size = _compute_device_size(host_size, dim_map, eps)
+    stride_map = _compute_stride_map(dim_map, host_size, host_stride, device_size)
+    device_stride = _compute_device_stride(device_size)
 
     return SpyreLayout(
         host_size=host_size,
         host_stride=host_stride,
-        dim_map=dim_map,
         device_size=device_size,
         stride_map=stride_map,
         device_stride=device_stride,
@@ -204,39 +199,38 @@ def make_layout(
 def host_flat_index_to_device_offset(layout: SpyreLayout, host_flat_index: int) -> int:
     """Return the device byte offset for a given host flat index.
 
-    Useful for verifying that two tensors with different layouts point to the
-    same physical data.
+    Uses stride_map to map from host index to device coordinates, matching
+    the semantics of compute_coordinates / device_coordinates in the inductor pipeline.
     """
-    byte_offset = 0
-    for j, (d, sm, ds, dstride) in enumerate(
-        zip(layout.dim_map, layout.stride_map, layout.device_size, layout.device_stride)
+    device_elem_offset = 0
+    for sm, ds, dstride in zip(
+        layout.stride_map, layout.device_size, layout.device_stride
     ):
         if sm <= 0:
             continue
         coord = (host_flat_index // sm) % ds
-        byte_offset += coord * dstride
+        device_elem_offset += coord * dstride
     word_bytes = BYTES_PER_STICK // layout.elems_per_stick
-    return byte_offset * word_bytes
+    return device_elem_offset * word_bytes
 
 
-def address_step_for_dim(
-    layout: SpyreLayout, sdsc_dim_name: str, sdsc_dims: list[str]
-) -> int | None:
-    """Return the byte step in device memory when the slice index for an SDSC
-    dimension increases by 1, given the per-core slice sizes in ss_.
+def per_core_span_sticks(
+    layout: SpyreLayout,
+    per_core_device_sizes: list[int],
+) -> int:
+    """Compute the per-core memory span in sticks.
 
-    sdsc_dim_name: the SDSC dimension label (e.g. 'in', 'out', 'mb')
-    sdsc_dims: ordered list of SDSC dim names matching layout.dim_map order
-               (excluding the stick device dim)
+    per_core_device_sizes: per-core size for each device dim (excluding stick dim).
+    The span is determined by the outermost device dim with per-core size > 1.
 
-    Returns None if the dimension is not found or not split.
+    Matches the span formula from docs/must_split_vars_rework.md.
     """
-    # This is mostly documentation — the actual check is in validator.py.
-    # The step formula (from debugging session):
-    #   stick dim:     (ss_[dim] // elems_per_stick) * device_stride[i] * word_bytes
-    #   non-stick dim: ss_[dim] * device_stride[i] * word_bytes
-    # where i is the device dim index for sdsc_dim_name.
-    return None  # placeholder; see validator.py for the live formula
+    device_size = layout.device_size[:-1]  # exclude stick dim
+    for i, (pc_size, _) in enumerate(zip(per_core_device_sizes, device_size)):
+        if pc_size > 1:
+            stride_in_sticks = math.prod(device_size[i + 1 :])
+            return pc_size * stride_in_sticks
+    return 1
 
 
 # ---------------------------------------------------------------------------
