@@ -74,6 +74,10 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
 - **write-rfc** — design proposal workflow (RFCs now at https://github.com/torch-spyre/rfcs)
+- **tensor-layout** — `SpyreTensorLayout` fields, `dim_map`/`device_size`/`stride_map` formulas,
+  stick tiling rules, and `layout_utils.py` for offline layout computation
+- **diagnose-sdsc** — validate SDSC JSON files for internal consistency (N_/ss_, addresses,
+  work-slice mapping, coordinate fold factors); run via `validator.py`
 
 ### Writing SKILL.md Files
 
