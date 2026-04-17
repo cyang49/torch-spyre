@@ -48,6 +48,7 @@ from .pass_utils import (
 from typing import Callable
 
 from .logging_utils import get_inductor_logger
+from .work_division_hint import HINT_KEY
 from . import config
 import logging
 
@@ -543,6 +544,74 @@ def span_reduction_pass(
         )
 
 
+def _get_work_division_hint(op: ComputedBuffer) -> list[int] | None:
+    """Extract a user-provided work division hint from FX node metadata."""
+    origins = getattr(op, "origins", None) or getattr(op.data, "origins", None)
+    if not origins:
+        return None
+    for fx_node in origins:
+        custom = getattr(fx_node, "meta", {}).get("custom", {})
+        hint = custom.get(HINT_KEY)
+        if hint is not None:
+            return list(hint)
+    return None
+
+
+def _apply_user_hint(
+    op: ComputedBuffer,
+    hint: list[int],
+    it_space: dict[Symbol, Expr],
+    max_cores: int,
+) -> dict[Symbol, int] | None:
+    """Validate a user hint and convert it to a symbol->split dict.
+
+    Returns None (with a warning) if the hint is structurally invalid.
+    Warns but still returns splits for soft violations (non-divisible, exceeds
+    max_cores).
+
+    The hint list is zipped positionally with it_space keys.  This relies on
+    it_space preserving insertion order (guaranteed by Python 3.7+ dicts).
+    For Reduction ops the order is output dims then reduction dims, established
+    by extract_read_writes(pointwise_size, reduction_size) in upstream Inductor
+    which creates index variables d0..dN sequentially.  For Pointwise ops the
+    order matches the output tensor shape.
+    """
+    symbols = list(it_space.keys())
+    op_name = op.get_name()
+
+    if len(hint) != len(symbols):
+        logger.warning(
+            f"work_division_hint: {op_name} has {len(symbols)} iteration dims "
+            f"but hint has {len(hint)} entries. Ignoring hint."
+        )
+        return None
+
+    splits: dict[Symbol, int] = {}
+    for sym, split_val in zip(symbols, hint):
+        if not isinstance(split_val, int) or split_val < 1:
+            logger.warning(
+                f"work_division_hint: {op_name} split value {split_val!r} for "
+                f"dim {sym} must be a positive integer. Ignoring hint."
+            )
+            return None
+        dim_size = int(it_space[sym])
+        if dim_size % split_val != 0:
+            logger.warning(
+                f"work_division_hint: {op_name} dim {sym} size={dim_size} "
+                f"not evenly divisible by split={split_val}. Applying anyway."
+            )
+        splits[sym] = split_val
+
+    product = math.prod(splits.values())
+    if product > max_cores:
+        logger.warning(
+            f"work_division_hint: {op_name} total cores={product} exceeds "
+            f"max_cores={max_cores}. Applying anyway (user override)."
+        )
+
+    return splits
+
+
 def work_distribution_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
@@ -558,6 +627,17 @@ def work_distribution_pass(
     all_tds = input_tds + [output_td]
 
     it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
+
+    if not config.ignore_work_division_hints:
+        user_hint = _get_work_division_hint(op)
+        if user_hint is not None:
+            user_splits = _apply_user_hint(op, user_hint, it_space, max_cores)
+            if user_splits is not None:
+                apply_splits(op, user_splits, output_td)
+                warn_if_per_core_overflow(
+                    input_tds + [output_td], it_space, user_splits, op.get_name()
+                )
+                return
 
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.

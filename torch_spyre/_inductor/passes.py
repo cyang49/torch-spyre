@@ -35,6 +35,13 @@ from .temp_passes import (
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
 )
+
+from .work_division_hint import (
+    collect_pre_pass_hints,
+    collect_work_division_hints,
+    propagate_post_pass_hints,
+    propagate_work_division_hints,
+)
 from . import config
 from .propagate_layouts import (
     propagate_mutation_layouts,
@@ -95,7 +102,9 @@ class CustomPreGradPasses:
     pre-grad FX graph.
     """
 
-    passes: List[Callable[[torch.fx.graph.Graph], None]] = []
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = [
+        collect_work_division_hints,
+    ]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in self.passes:
@@ -111,7 +120,10 @@ class CustomPrePasses(CustomGraphPass):
     """
     The list of custom passes to run
     """
-    passes: List[Callable[[torch.fx.graph.Graph], None]] = []
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = [
+        propagate_work_division_hints,
+        collect_pre_pass_hints,
+    ]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in CustomPrePasses.passes:
@@ -133,6 +145,7 @@ class CustomPostPasses(CustomGraphPass):
     The list of custom passes to run
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
+        propagate_post_pass_hints,
         convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,

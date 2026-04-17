@@ -23,6 +23,10 @@ global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == 
 
 allow_all_ops_in_lx_planning: bool = False
 
+ignore_work_division_hints: bool = (
+    os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+)
+
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
