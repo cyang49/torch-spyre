@@ -19,6 +19,10 @@ from torch.utils._config_module import install_config_module
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "0") == "1"
 
+ignore_work_division_hints: bool = (
+    os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+)
+
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
 allow_all_ops_in_lx_planning: bool = False
