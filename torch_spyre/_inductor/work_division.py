@@ -660,16 +660,18 @@ def work_distribution_pass(
                         f"reduces splits committed by span_reduction for "
                         f"dims {list(dropped)}. Applying anyway."
                     )
-                apply_splits(
-                    op,
-                    user_splits,
-                    output_td,
-                    it_space,
-                    it_space_adjusted,
-                    list(it_space.keys()),
-                    committed_splits,
-                    kind="work_distribution(user-hint)",
-                )
+                apply_splits(op, user_splits, output_td)
+                if (
+                    logger.isEnabledFor(logging.DEBUG)
+                    and math.prod(user_splits.values()) > 1
+                ):
+                    logger.debug(
+                        f"work_distribution(user-hint) work_division {op.get_name()}: "
+                        f"cores={math.prod(user_splits.values())}, "
+                        f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+                        f"min_splits={committed_splits}, user_splits={user_splits}, "
+                        f"op_it_space_splits={op.op_it_space_splits}"
+                    )
                 warn_if_per_core_overflow(all_tds, it_space, user_splits, op.get_name())
                 return
 
