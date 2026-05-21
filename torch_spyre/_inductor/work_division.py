@@ -626,18 +626,13 @@ def work_distribution_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
-
+    user_splits = None
     if not config.ignore_work_division_hints:
         user_hint = _get_work_division_hint(op)
         if user_hint is not None:
             user_splits = _apply_user_hint(op, user_hint, it_space, max_cores)
-            if user_splits is not None:
-                apply_splits(op, user_splits, output_td)
-                warn_if_per_core_overflow(
-                    input_tds + [output_td], it_space, user_splits, op.get_name()
-                )
-                return
+
+    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
 
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.
@@ -683,6 +678,9 @@ def work_distribution_pass(
         committed_splits,
     )
 
+    if user_splits is not None:
+        splits = user_splits
+
     apply_splits(op, splits, output_td)
 
     if logger.isEnabledFor(logging.DEBUG) and math.prod(splits.values()) > 1:
@@ -690,7 +688,7 @@ def work_distribution_pass(
             f"work_distribution work_division {op.get_name()}: cores={math.prod(splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
             f"priorities={output_dims + reduction_dims}, min_splits={committed_splits}, "
-            f"op_it_space_splits={op.op_it_space_splits}"
+            f"op_it_space_splits{('[HINT]' if user_splits is not None else '')}={op.op_it_space_splits}"
         )
 
     warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name())
