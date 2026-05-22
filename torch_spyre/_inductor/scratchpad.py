@@ -15,6 +15,7 @@
 import math
 from typing import Callable, Any, Optional, override
 
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
@@ -26,6 +27,7 @@ from torch._inductor.virtualized import V
 from torch._inductor.graph import GraphLowering
 from .logging_utils import get_inductor_logger
 from .ir import FixedTiledLayout, TensorBox
+from .pass_utils import _per_core_view_on_buf
 from . import config
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
@@ -331,13 +333,17 @@ class GreedyAllocationStrategy(AllocationStrategy):
         buf_read_counts: dict[str, int] = {}
         buf_write_counts: dict[str, int] = {}
         buf_users: dict[str, Operation] = {}
-        buf_users_read_and_write: dict[str, list[Operation]] = {}
+        # In-place ops (same op reads & writes the same buf) get two entries:
+        # one per dep. If their per-core views diverge — read at one index,
+        # write at another — the buffer is correctly rejected for LX, since
+        # that's a within-core data hazard, not just cross-op disagreement.
+        buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]] = {}
         core_div_mismatch: dict[str, bool] = {}
 
         for idx, op in enumerate(operations):
             rw = op.get_read_writes()
             read_names = op.get_read_names()
-            for dep in rw.reads | rw.writes:  # union of the OrderedSets
+            for dep in rw.reads | rw.writes:
                 buf = dep.name  # buffer name, i.e. a str
                 last_used[buf] = idx
                 if buf in read_names:
@@ -345,9 +351,7 @@ class GreedyAllocationStrategy(AllocationStrategy):
                     buf_users[buf] = buf_users.get(buf, []) + [op]
                 else:
                     buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
-                buf_users_read_and_write[buf] = buf_users_read_and_write.get(
-                    buf, []
-                ) + [op]
+                buf_user_deps.setdefault(buf, []).append((op, dep))
 
         bufs_to_dealloc_at_idx: dict = {}
         for buf, idx in last_used.items():
@@ -358,14 +362,15 @@ class GreedyAllocationStrategy(AllocationStrategy):
                 bufs_to_dealloc_at_idx[idx + 1] = [buf]
 
         using_multicore = config.sencores > 1
-        for buf_name, users_rw in buf_users_read_and_write.items():
+        for buf_name, users in buf_user_deps.items():
             # this dict includes graph input and output
             same_core_div = True
-            if using_multicore and len(users_rw) > 1:
+            if using_multicore and len(users) > 1:
                 # graph input and output can have only 1 read or 1 write user.
-                u0_split = users_rw[0].op_it_space_splits  # a list like [16, 1]
+                ref = _per_core_view_on_buf(*users[0], buf_name)
                 same_core_div = all(
-                    u0_split == u.op_it_space_splits for u in users_rw[1:]
+                    _per_core_view_on_buf(*u, buf_name) == ref
+                    for u in users[1:]
                 )
             core_div_mismatch[buf_name] = not same_core_div
 
