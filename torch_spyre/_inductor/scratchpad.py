@@ -366,12 +366,25 @@ class GreedyAllocationStrategy(AllocationStrategy):
             # this dict includes graph input and output
             same_core_div = True
             if using_multicore and len(users) > 1:
-                # graph input and output can have only 1 read or 1 write user.
-                ref = _per_core_view_on_buf(*users[0], buf_name)
-                same_core_div = all(
-                    _per_core_view_on_buf(*u, buf_name) == ref
-                    for u in users[1:]
+                # K-split-reduction producers leave partial sums on most cores;
+                # only k-last cores hold the final value. Without a broadcast
+                # codepath (TODO above) the buffer is not safe on LX, even if
+                # slab geometry happens to match. The flag is meaningful only
+                # for write-deps — a consumer reading a K-split input still
+                # gets its own valid slab.
+                analyzed = [
+                    (op, dep, *_per_core_view_on_buf(op, dep, buf_name))
+                    for op, dep in users
+                ]
+                producer_partials = any(
+                    flag for op, dep, _, flag in analyzed
+                    if dep in op.get_read_writes().writes
                 )
+                if producer_partials:
+                    same_core_div = False
+                else:
+                    ref = analyzed[0][2]
+                    same_core_div = all(view == ref for _, _, view, _ in analyzed[1:])
             core_div_mismatch[buf_name] = not same_core_div
 
         return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
