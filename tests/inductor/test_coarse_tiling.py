@@ -2271,6 +2271,24 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertEqual(consumers, [])
         self.assertTrue(is_out)
 
+    def test_patch_graph_outputs_replaces_tensorbox_wrapped_buffer(self):
+        from torch._inductor.virtualized import V
+        from torch._inductor.ir import ComputedBuffer, StorageBox, TensorBox
+        from torch_spyre._inductor.coarse_tile import _patch_graph_outputs
+
+        old_buf = MagicMock(spec=ComputedBuffer)
+        old_buf.get_name.return_value = "op0"
+        new_buf = MagicMock(spec=ComputedBuffer)
+        graph = SimpleNamespace(graph_outputs=[TensorBox(StorageBox(old_buf))])
+
+        with V.set_graph_handler(graph):
+            _patch_graph_outputs("op0", new_buf)
+
+        replacement = graph.graph_outputs[0]
+        self.assertIsInstance(replacement, TensorBox)
+        self.assertIsInstance(replacement.data, StorageBox)
+        self.assertIs(replacement.data.data, new_buf)
+
     def test_inside_consumer_not_counted_as_outside(self):
         from torch_spyre._inductor.coarse_tile import _find_outside_consumers
 

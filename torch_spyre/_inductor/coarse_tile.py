@@ -1103,15 +1103,19 @@ def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
     except Exception:
         return
 
-    new_tb = TensorBox(StorageBox(new_buf))
     for i, out in enumerate(outputs):
-        # Unwrap StorageBox layers to reach ComputedBuffer without going into
-        # the ComputedBuffer's inner data (Pointwise / Reduction).
+        # Graph outputs may be bare buffers or wrapped in TensorBox/StorageBox.
+        # Preserve the wrapper shape when replacing the underlying buffer.
+        wrappers = []
         candidate = out
-        while isinstance(candidate, StorageBox):
+        while isinstance(candidate, (TensorBox, StorageBox)):
+            wrappers.append(type(candidate))
             candidate = candidate.data
         if isinstance(candidate, ComputedBuffer) and candidate.get_name() == old_name:
-            outputs[i] = new_tb
+            replacement = new_buf
+            for wrapper in reversed(wrappers):
+                replacement = wrapper(replacement)
+            outputs[i] = replacement
 
 
 # ---------------------------------------------------------------------------

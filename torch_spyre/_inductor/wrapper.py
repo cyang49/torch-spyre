@@ -134,6 +134,35 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
 
+    def _rewrite_mutation_alias_ref(self, ref: str) -> str:
+        scheduler = getattr(V.graph, "scheduler", None)
+        mutation_real_name = getattr(scheduler, "mutation_real_name", {})
+
+        for old_name, real_name in mutation_real_name.items():
+            if old_name == real_name:
+                continue
+            if ref == old_name:
+                return real_name
+            ref = ref.replace(
+                f"reinterpret_tensor({old_name},",
+                f"reinterpret_tensor({real_name},",
+                1,
+            )
+            ref = ref.replace(
+                f"aten.view.dtype({old_name},",
+                f"aten.view.dtype({real_name},",
+                1,
+            )
+        return ref
+
+    def codegen_reinterpret_view(self, *args, **kwargs) -> str:
+        ref = super().codegen_reinterpret_view(*args, **kwargs)
+        return self._rewrite_mutation_alias_ref(ref)
+
+    def generate_return(self, output_refs: list[str]) -> None:
+        output_refs = [self._rewrite_mutation_alias_ref(ref) for ref in output_refs]
+        super().generate_return(output_refs)
+
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()
         old_name = old.get_name()
