@@ -163,6 +163,12 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         output_refs = [self._rewrite_mutation_alias_ref(ref) for ref in output_refs]
         super().generate_return(output_refs)
 
+    def make_buffer_free(self, buffer):
+        layout = buffer.get_layout()
+        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+            return ""
+        return super().make_buffer_free(buffer)
+
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()
         old_name = old.get_name()
