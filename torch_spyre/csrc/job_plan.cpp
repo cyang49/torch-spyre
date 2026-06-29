@@ -69,8 +69,8 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(address);
     }
   }
-  flex::ComputeParams params(&program_address_, std::move(tensor_allocs),
-                             name_, bootstrap_offset_);
+  flex::ComputeParams params(&program_address_, std::move(tensor_allocs), name_,
+                             bootstrap_offset_);
   params.pipeline_barrier = pipeline_barrier_;
   stream.launchCompute(&params);
 }

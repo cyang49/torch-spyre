@@ -283,8 +283,9 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   if (cmd.contains("name") && cmd["name"].is_string()) {
     name = cmd["name"].get<std::string>();
   } else {
-    auto inner = spyrecode_dir_.filename();              // spyreCodeDir
-    auto sdsc = spyrecode_dir_.parent_path().filename(); // sdsc_fused_..._vx...
+    auto inner = spyrecode_dir_.filename();  // spyreCodeDir
+    auto sdsc =
+        spyrecode_dir_.parent_path().filename();  // sdsc_fused_..._vx...
     name = (sdsc / inner / "bundle.mlir").string() + "#" +
            std::to_string(step_idx);
   }
