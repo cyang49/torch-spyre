@@ -86,6 +86,7 @@ from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _iter_op_specs,
     _preserve_shared_weight_unit_bmm_dim,
+    _retile_per_tile_view_index,
 )
 from torch_spyre._inductor.temp_passes import (
     _mark_static_unit_batch_bmm,
@@ -448,6 +449,50 @@ class TestCoarseTileInfo(unittest.TestCase):
         self.assertEqual(info.loop_group_id, (0, 0))
         self.assertEqual(info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(info.loop_tiled_dims, [[0], [1]])
+
+
+class TestRetilePerTileViewIndex(unittest.TestCase):
+    def _layout(self):
+        return SimpleNamespace(
+            size=[1, 4, 512],
+            stride=[2048, 512, 1],
+            per_tile_fixed=True,
+        )
+
+    def _node(self):
+        return SimpleNamespace(
+            name="buf",
+            loop_info=CoarseTileInfo(
+                loop_group_id=(0,),
+                loop_count=[Integer(4)],
+                loop_tiled_dims=[[2]],
+            ),
+        )
+
+    def test_rewrites_full_stride_to_tile_stride(self):
+        c0, c1 = sympy.symbols("c0 c1")
+
+        result = _retile_per_tile_view_index(
+            2048 * c0 + c1,
+            self._layout(),
+            self._node(),
+            {c0: Integer(4), c1: Integer(512)},
+        )
+
+        self.assertEqual(simplify(result - (512 * c0 + c1)), 0)
+
+    def test_mixed_loop_variable_terms_are_not_rewritten(self):
+        c0, c1, c2 = sympy.symbols("c0 c1 c2")
+        index = c0 * c1 + 128 * c0 + c2
+
+        result = _retile_per_tile_view_index(
+            index,
+            self._layout(),
+            self._node(),
+            {c0: Integer(4), c1: Integer(512), c2: Integer(128)},
+        )
+
+        self.assertEqual(simplify(result - index), 0)
 
 
 # ===========================================================================

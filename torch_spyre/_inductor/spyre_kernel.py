@@ -115,17 +115,39 @@ def _retile_per_tile_view_index(
 
     replacements = {var: sympy.S.Zero for var in loop_vars}
     offset = index.xreplace(replacements)
+    projection_terms: dict[sympy.Symbol, sympy.Expr] = {}
+    for var in sorted(loop_vars, key=str):
+        other_vars = {other: sympy.S.Zero for other in loop_vars if other != var}
+        projection_terms[var] = sympy.expand(index.xreplace(other_vars) - offset)
+
+    residual = sympy.simplify(index - offset - sum(projection_terms.values()))
+    if residual != 0:
+        logger.warning(
+            "retile_per_tile_view_index: refusing rewrite for node=%s index=%s "
+            "because it has mixed loop-variable residual %s",
+            getattr(ir_node, "name", None),
+            index,
+            residual,
+        )
+        return index
+
     adjusted_index = offset
     changed = False
 
     for var in sorted(loop_vars, key=str):
-        other_vars = {other: sympy.S.Zero for other in loop_vars if other != var}
-        term = sympy.expand(index.xreplace(other_vars) - offset)
+        term = projection_terms[var]
         coeff = term.coeff(var)
         remainder = sympy.simplify(term - coeff * var)
         if remainder != 0:
-            adjusted_index += term
-            continue
+            logger.warning(
+                "retile_per_tile_view_index: refusing rewrite for node=%s index=%s "
+                "because projection for %s is non-affine: %s",
+                getattr(ir_node, "name", None),
+                index,
+                var,
+                term,
+            )
+            return index
 
         var_range = concretize_expr(it_space[var])
         candidates: list[sympy.Expr] = []
