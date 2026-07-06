@@ -79,6 +79,92 @@ class TensorAccess(RValue):
     layout: FixedTiledLayout
 
 
+def _retile_per_tile_view_index(
+    index: sympy.Expr,
+    layout: FixedTiledLayout,
+    ir_node: Any,
+    it_space: dict[sympy.Symbol, sympy.Expr],
+) -> sympy.Expr:
+    """Repair full-stride view indexes after output-dim coarse tiling.
+
+    A ReinterpretView over a buffer can keep the original full-tensor host
+    strides even after coarse tiling shrinks the underlying scratch buffer.
+    When the load reaches this backend, the base layout is already per-tile
+    sized, so convert coefficients that still match the pre-tile stride back
+    to the current per-tile stride.
+    """
+    if not getattr(layout, "per_tile_fixed", False):
+        return index
+
+    loop_info = getattr(ir_node, "loop_info", None)
+    if loop_info is None:
+        return index
+
+    tiled_counts: dict[int, sympy.Expr] = {}
+    for count, dims in zip(loop_info.loop_count, loop_info.loop_tiled_dims):
+        for dim in dims:
+            if 0 <= dim < len(layout.size):
+                tiled_counts[dim] = tiled_counts.get(dim, sympy.S.One) * count
+
+    if not tiled_counts:
+        return index
+
+    loop_vars = index.free_symbols.intersection(it_space.keys())
+    if not loop_vars:
+        return index
+
+    replacements = {var: sympy.S.Zero for var in loop_vars}
+    offset = index.xreplace(replacements)
+    adjusted_index = offset
+    changed = False
+
+    for var in sorted(loop_vars, key=str):
+        other_vars = {other: sympy.S.Zero for other in loop_vars if other != var}
+        term = sympy.expand(index.xreplace(other_vars) - offset)
+        coeff = term.coeff(var)
+        remainder = sympy.simplify(term - coeff * var)
+        if remainder != 0:
+            adjusted_index += term
+            continue
+
+        var_range = concretize_expr(it_space[var])
+        candidates: list[sympy.Expr] = []
+        for host_dim, (size, stride) in enumerate(zip(layout.size, layout.stride)):
+            if concretize_expr(size) != var_range:
+                continue
+
+            factor = sympy.S.One
+            for tiled_dim, count in tiled_counts.items():
+                if tiled_dim > host_dim:
+                    factor *= count
+
+            if factor == 1:
+                continue
+
+            expected_full_stride = sympy.simplify(stride * factor)
+            if sympy.simplify(coeff - expected_full_stride) == 0:
+                candidates.append(stride)
+
+        if len(candidates) == 1:
+            adjusted_index += candidates[0] * var
+            changed = True
+        else:
+            adjusted_index += term
+
+    if changed:
+        logger.debug(
+            "retile_per_tile_view_index: node=%s size=%s stride=%s %s -> %s",
+            getattr(ir_node, "name", None),
+            list(layout.size),
+            list(layout.stride),
+            index,
+            adjusted_index,
+        )
+        return sympy.simplify(adjusted_index)
+
+    return index
+
+
 def _preserve_shared_weight_unit_bmm_dim(
     op: str,
     it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
@@ -706,6 +792,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
+        index = _retile_per_tile_view_index(
+            index, layout, self.current_node.node, iteration_space(self.current_node)
+        )
         return TensorAccess(name, index, layout)
 
     def store(
