@@ -27,7 +27,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
 )
-from torch_spyre._inductor.views import compute_coordinates
+from torch_spyre._inductor.views import align_tensors, compute_coordinates
 from torch.utils._sympy.functions import ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
@@ -211,6 +211,66 @@ class TestCoordinates(TestCase):
             5760 * p0 + 384 * p1 + p2 + 128,
         )
         self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
+
+    def test_align_tensors_coalesces_constant_gap_dims(self):
+        iteration_space = {p0: (2, 1), p1: (1024, 1), p2: (128, 1)}
+        new_iteration_space, tensors = align_tensors(
+            iteration_space,
+            [
+                {
+                    "size": [8, 1024, 2, 1, 64],
+                    "coordinates": [
+                        4 * p0,
+                        p1,
+                        sympy.floor(p2 / 64),
+                        sympy.S.Zero,
+                        sympy.Mod(p2, 64),
+                    ],
+                },
+                {
+                    "size": [1024, 1, 2, 2, 64],
+                    "coordinates": [
+                        p1,
+                        sympy.S.Zero,
+                        sympy.floor(p2 / 64),
+                        p0,
+                        sympy.Mod(p2, 64),
+                    ],
+                },
+            ],
+        )
+
+        self.assertEqual(new_iteration_space, iteration_space)
+        self.assertEqual(tensors[0]["size"], [2, 4096, 2, 64])
+        self.assertEqual(
+            tensors[0]["coordinates"],
+            [p0, p1, sympy.floor(p2 / 64), sympy.Mod(p2, 64)],
+        )
+
+    def test_align_tensors_coalesces_repeated_constant_gap_dims(self):
+        iteration_space = {p0: (2, 1), p1: (3, 1), p2: (5, 1), p3: (128, 1)}
+        new_iteration_space, tensors = align_tensors(
+            iteration_space,
+            [
+                {
+                    "size": [8, 15, 5, 1, 64],
+                    "coordinates": [
+                        4 * p0,
+                        5 * p1,
+                        p2,
+                        sympy.S.Zero,
+                        sympy.Mod(p3, 64),
+                    ],
+                },
+            ],
+        )
+
+        self.assertEqual(new_iteration_space, iteration_space)
+        self.assertEqual(tensors[0]["size"], [1, 2, 12, 25, 64])
+        self.assertEqual(
+            tensors[0]["coordinates"],
+            [sympy.floor(p3 / 64), p0, p1, p2, sympy.Mod(p3, 64)],
+        )
 
 
 class TestUnrepresentableStickCandidates(TestCase):

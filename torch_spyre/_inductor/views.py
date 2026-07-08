@@ -709,6 +709,51 @@ def align_tensors(
         )
         new_tensors.append({"size": size, "coordinates": coordinates})
 
+    def _exact_div(a, b):
+        a = sympy.sympify(a)
+        b = sympy.sympify(b)
+        if isinstance(a, sympy.Integer) and isinstance(b, sympy.Integer):
+            if int(a) % int(b) != 0:
+                return None
+            return sympy.Integer(int(a) // int(b))
+        q = sympy.simplify(a / b)
+        return q if q.is_integer else None
+
+    def _coalesce_constant_gap_dims(tensor):
+        """Fold zero-coordinate physical gap dims into adjacent logical dims."""
+        size = tensor["size"]
+        coordinates = tensor["coordinates"]
+        i = 0
+        while i + 2 < len(size) - 1:
+            # A term like 4*c0 is normalized as [c0, 0], with the size-4
+            # zero-coordinate dim carrying only physical stride.  For row-major
+            # coordinates, [A, G, B] with coords [a, 0, b] is equivalent to
+            # [A/G, B*G] with coords [a, b], when A is divisible by G.
+            gap_coord = coordinates[i + 1]
+            gap_size = size[i + 1]
+            if gap_coord != 0 or _concretize_for_cmp(gap_size) <= 1:
+                i += 1
+                continue
+
+            outer_coord = coordinates[i]
+            inner_coord = coordinates[i + 2]
+            if not outer_coord.free_symbols or not inner_coord.free_symbols:
+                i += 1
+                continue
+
+            outer_size = _exact_div(size[i], gap_size)
+            if outer_size is None:
+                i += 1
+                continue
+
+            size[i] = outer_size
+            size[i + 2] = sympy.simplify(size[i + 2] * gap_size)
+            del size[i + 1]
+            del coordinates[i + 1]
+
+    for tensor in new_tensors:
+        _coalesce_constant_gap_dims(tensor)
+
     # decide desired rank for all tensors
     rank = 0
     for i, t in enumerate(new_tensors):
