@@ -246,6 +246,11 @@ class TestCoordinates(TestCase):
             tensors[0]["coordinates"],
             [p0, p1, sympy.floor(p2 / 64), sympy.Mod(p2, 64)],
         )
+        self.assertEqual(tensors[1]["size"], [1024, 2, 2, 64])
+        self.assertEqual(
+            tensors[1]["coordinates"],
+            [p1, sympy.floor(p2 / 64), p0, sympy.Mod(p2, 64)],
+        )
 
     def test_align_tensors_coalesces_repeated_constant_gap_dims(self):
         iteration_space = {p0: (2, 1), p1: (3, 1), p2: (5, 1), p3: (128, 1)}
