@@ -59,6 +59,7 @@ from .propagate_named_dims import propagate_named_dims, assign_dim_hints
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
+    resolve_copy_back_candidates,
 )
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import (
@@ -355,6 +356,7 @@ class CustomPreSchedulingPasses:
             propagate_spyre_tensor_layouts,
             validate_ops,
             optimize_restickify_locations,
+            resolve_copy_back_candidates,
             finalize_layouts,
             insert_restickify,
             insert_post_mutation_restickify,

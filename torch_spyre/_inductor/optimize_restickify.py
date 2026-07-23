@@ -198,11 +198,11 @@ class FixedInOutNode(RestickNodeCost):
     def __init__(
         self,
         edge_costs,
-        required_out_stl: "SpyreTensorLayout",
+        required_out_stls: "list[SpyreTensorLayout]",
         required_in_stls: "list[SpyreTensorLayout]",
     ):
         super().__init__(edge_costs)
-        self.required_out_stl = required_out_stl  # output layout currently assigned
+        self.required_out_stls = required_out_stls
         self.required_in_stls = (
             required_in_stls  # each input must be stick-compatible with this layout
         )
@@ -210,16 +210,18 @@ class FixedInOutNode(RestickNodeCost):
     @classmethod
     def from_args(cls, args, out_stl, req_stls, op):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
+        out_stls = out_stl if isinstance(out_stl, list) else [out_stl]
+        assert out_stls, "FixedInOutNode.from_args: out_stls is empty"
         edge_costs = [
             EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
             for arg, req in zip(args, req_stls)
         ]
-        return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
+        return cls(edge_costs, required_out_stls=out_stls, required_in_stls=req_stls)
 
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
-        if out_stl != self.required_out_stl:
+        if out_stl not in self.required_out_stls:
             return INF
         return sum(
             ec.cost(lk, rk)
@@ -230,7 +232,7 @@ class FixedInOutNode(RestickNodeCost):
         return list(zip(self.edge_costs, self.required_in_stls))
 
     def min_input_cost(self, dep_name, in_stl, out_stl):
-        if out_stl != self.required_out_stl:
+        if out_stl not in self.required_out_stls:
             return INF
         # Returns on first match. If dep_name appears twice (e.g. matmul(x, x)),
         # the two positions may have different required_in_stls — this would return

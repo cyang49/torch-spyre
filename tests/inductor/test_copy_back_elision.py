@@ -28,9 +28,14 @@ DEVICE = torch.device("spyre")
 SIZE = 128
 
 
-def _compile_and_source(fn, *args):
+def _compile_and_source(fn, *args, device_layouts=None):
     torch._dynamo.reset()
-    device_args = tuple(arg.to(DEVICE) for arg in args)
+    if device_layouts is None:
+        device_layouts = [None] * len(args)
+    device_args = tuple(
+        arg.to(DEVICE) if layout is None else arg.to(device_layout=layout)
+        for arg, layout in zip(args, device_layouts)
+    )
     compiled_out, code = run_and_get_code(torch.compile(fn), *device_args)
     return compiled_out, code[0], device_args
 
@@ -65,6 +70,118 @@ def test_mm_out_copy_back_into_input_is_elided(global_stick_optimizer):
     torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
     torch.testing.assert_close(device_args[2].cpu(), expected_z, atol=0.1, rtol=0.1)
     _assert_copy_back_elided(source)
+
+
+@pytest.mark.parametrize("policy", ["prefer", "force"])
+@pytest.mark.parametrize("global_stick_optimizer", [True, False])
+def test_batchmatmul_out_prefers_preallocated_output_layout(
+    policy, global_stick_optimizer
+):
+    torch.manual_seed(0xB17)
+    shape = (2, SIZE, SIZE)
+    x = torch.randn(*shape, dtype=torch.float16)
+    y = torch.randn(*shape, dtype=torch.float16)
+    z = torch.randn(*shape, dtype=torch.float16)
+    w = torch.randn(*shape, dtype=torch.float16)
+    z_layout = SpyreTensorLayout(
+        list(shape),
+        [SIZE * SIZE, SIZE, 1],
+        torch.float16,
+        [1, 0, 2],
+    )
+
+    def fn(x, y, z, w):
+        torch.bmm(x, y, out=z)
+        return z + w
+
+    expected_z = z.clone()
+    expected = fn(x, y, expected_z, w)
+    with inductor_config.patch(
+        {
+            "global_stick_optimizer": global_stick_optimizer,
+            "preallocated_output_layout_policy": policy,
+            "preallocated_output_layout_ops": "batchmatmul",
+        }
+    ):
+        actual, source, device_args = _compile_and_source(
+            fn, x, y, z, w, device_layouts=[None, None, z_layout, None]
+        )
+
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(device_args[2].cpu(), expected_z, atol=0.1, rtol=0.1)
+    assert device_args[2].device_tensor_layout() == z_layout
+    _assert_copy_back_elided(source)
+
+
+def test_batchmatmul_out_preallocated_layout_respects_whitelist():
+    torch.manual_seed(0xB18)
+    shape = (2, SIZE, SIZE)
+    x = torch.randn(*shape, dtype=torch.float16)
+    y = torch.randn(*shape, dtype=torch.float16)
+    z = torch.randn(*shape, dtype=torch.float16)
+    w = torch.randn(*shape, dtype=torch.float16)
+    z_layout = SpyreTensorLayout(
+        list(shape),
+        [SIZE * SIZE, SIZE, 1],
+        torch.float16,
+        [1, 0, 2],
+    )
+
+    def fn(x, y, z, w):
+        torch.bmm(x, y, out=z)
+        return z + w
+
+    expected_z = z.clone()
+    expected = fn(x, y, expected_z, w)
+    with inductor_config.patch({"preallocated_output_layout_ops": ""}):
+        actual, source, device_args = _compile_and_source(
+            fn, x, y, z, w, device_layouts=[None, None, z_layout, None]
+        )
+
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(device_args[2].cpu(), expected_z, atol=0.1, rtol=0.1)
+    _assert_copy_back_preserved(source)
+
+
+def test_preallocated_output_layout_ops_rejects_unsupported_ops():
+    with inductor_config.patch({"preallocated_output_layout_ops": "add,batchmatmul"}):
+        with pytest.raises(ValueError, match="Invalid preallocated_output_layout_ops"):
+            propagate_layouts._preallocated_output_layout_ops()
+
+
+def test_batchmatmul_out_infeasible_preallocated_layout_preserves_copy_back():
+    torch.manual_seed(0xB19)
+    shape = (2, SIZE, SIZE)
+    x = torch.randn(*shape, dtype=torch.float16)
+    y = torch.randn(*shape, dtype=torch.float16)
+    z = torch.randn(*shape, dtype=torch.float16)
+    w = torch.randn(*shape, dtype=torch.float16)
+    z_layout = SpyreTensorLayout(
+        list(shape),
+        [SIZE * SIZE, SIZE, 1],
+        torch.float16,
+        [0, 2, 1],
+    )
+
+    def fn(x, y, z, w):
+        torch.bmm(x, y, out=z)
+        return z + w
+
+    expected_z = z.clone()
+    expected = fn(x, y, expected_z, w)
+    with inductor_config.patch(
+        {
+            "preallocated_output_layout_policy": "force",
+            "preallocated_output_layout_ops": "batchmatmul",
+        }
+    ):
+        actual, source, device_args = _compile_and_source(
+            fn, x, y, z, w, device_layouts=[None, None, z_layout, None]
+        )
+
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(device_args[2].cpu(), expected_z, atol=0.1, rtol=0.1)
+    _assert_copy_back_preserved(source)
 
 
 @pytest.mark.parametrize("shape", [(SIZE, SIZE), (2, 65, 130)])

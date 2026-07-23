@@ -27,6 +27,14 @@ hbm_planning: bool = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
+preallocated_output_layout_policy: Literal["prefer", "force"] = os.environ.get(
+    "SPYRE_PREALLOCATED_OUTPUT_LAYOUT_POLICY", "prefer"
+)  # type: ignore[assignment]
+
+preallocated_output_layout_ops: str = os.environ.get(
+    "SPYRE_PREALLOCATED_OUTPUT_LAYOUT_OPS", "batchmatmul"
+)
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))

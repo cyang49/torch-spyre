@@ -88,6 +88,7 @@ logger = get_inductor_logger("propagate_layouts")
 prims = torch.ops.prims
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
+VALID_PREALLOCATED_OUTPUT_LAYOUT_OPS = frozenset({BATCH_MATMUL_OP})
 
 
 class PropArg(NamedTuple):
@@ -100,6 +101,16 @@ class PropArg(NamedTuple):
     dep: MemoryDep
     layout: FixedLayout
     layouts: list[SpyreTensorLayout]
+
+
+class CopyBackCandidate(NamedTuple):
+    copy_op: ComputedBuffer
+    source: MemoryDep
+    destination: MemoryDep
+    target: Operation
+    target_name: str
+    target_stl: SpyreTensorLayout
+    producer: ComputedBuffer
 
 
 def _get_prop_args(reads) -> list[PropArg]:
@@ -659,6 +670,40 @@ def find_stick_compatible_input_layout(
     )
 
 
+def _preferred_output_stl_for_matmul(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    generated_var: sympy.Symbol,
+) -> SpyreTensorLayout | None:
+    """Return the preallocated-output STL if it satisfies matmul's output rule.
+
+    A batchmatmul output must stick on the generated/N variable.  The target STL
+    is only a valid early candidate when it preserves the producer's host layout,
+    uses the standard element arrangement, and has an offset-free generated-var
+    stick expression.
+    """
+    target_stl = getattr(op, "_preallocated_output_stl", None)
+    if target_stl is None:
+        return None
+    if target_stl.element_arrangement != ElementArrangement.STANDARD:
+        return None
+    if not _same_host_layout(
+        output, getattr(op, "_preallocated_output_layout", output)
+    ):
+        return None
+
+    target_coords = try_device_coordinates(target_stl, output_dep, None)
+    if target_coords is None:
+        return None
+    target_stick = target_coords[-1]
+    if generated_var not in target_stick.free_symbols:
+        return None
+    if not is_stick_expr_offset_free(target_stick, target_stl.elems_per_stick()):
+        return None
+    return target_stl
+
+
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -719,10 +764,23 @@ def _matmul_layouts(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_stl, y_req_stl], op
+
+    layouts = [out_stl]
+    preferred_stl = _preferred_output_stl_for_matmul(
+        op, output, output_dep, generated_var
     )
-    return [out_stl]
+    if preferred_stl is not None:
+        if config.preallocated_output_layout_policy == "force":
+            layouts = [preferred_stl]
+        elif preferred_stl != out_stl:
+            layouts = [preferred_stl, out_stl]
+        else:
+            layouts = [out_stl]
+
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        [x, y], layouts, [x_req_stl, y_req_stl], op
+    )
+    return layouts
 
 
 def _multi_arg_pointwise_layouts(
@@ -1200,13 +1258,55 @@ def _find_alt_target_stl(
     return candidates[0]
 
 
-def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
-    """Commit safe lowering-marked copy-back candidates.
+def _preallocated_output_layout_ops() -> set[str]:
+    """Parse the configured producer whitelist for preallocated-output layout use."""
+    ops = {
+        op.strip()
+        for op in config.preallocated_output_layout_ops.split(",")
+        if op.strip()
+    }
+    invalid_ops = ops - VALID_PREALLOCATED_OUTPUT_LAYOUT_OPS
+    if invalid_ops:
+        valid = ", ".join(sorted(VALID_PREALLOCATED_OUTPUT_LAYOUT_OPS))
+        invalid = ", ".join(sorted(invalid_ops))
+        raise ValueError(
+            "Invalid preallocated_output_layout_ops config value(s): "
+            f"{invalid}. Valid values are: {valid}."
+        )
+    return ops
+
+
+def _copy_back_producer_kind(producer: ComputedBuffer) -> str | None:
+    """Return the whitelist key for a copy-back producer, such as ``batchmatmul``."""
+    data = producer.data
+    if isinstance(data, Reduction):
+        return data.reduction_type
+    if isinstance(data, Pointwise):
+        origin = next(iter(data.origins), None)
+        target = getattr(origin, "target", None)
+        target_name = getattr(target, "name", None)
+        if callable(target_name):
+            return target_name().split("::")[-1].split(".")[0]
+        return str(target) if target else None
+    return None
+
+
+def _producer_allows_preallocated_output_layout(producer: ComputedBuffer) -> bool:
+    """Return whether the producer is enabled for early destination-layout use."""
+    kind = _copy_back_producer_kind(producer)
+    return kind is not None and kind in _preallocated_output_layout_ops()
+
+
+def _safe_copy_back_candidates(
+    operations: list[Operation],
+    *,
+    require_preallocated_layout_whitelist: bool,
+) -> list[CopyBackCandidate]:
+    """Return structurally safe graph-input copy-back candidates.
 
     ``aten.copy_`` lowering marks structural candidates but leaves the explicit
-    copy intact.  Once layout propagation has computed producer layouts, this
-    resolver proves the full safety condition.  Failed candidates remain normal
-    copies.
+    copy intact. This helper proves the shared safety condition used both when
+    marking producer layout preferences and when removing committed copy-backs.
     """
     writer_by_name: dict[str, Operation] = {}
     write_counts: Counter[str] = Counter()
@@ -1223,8 +1323,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
 
     graph_inputs = set(V.graph.graph_input_names)
     graph_outputs = set(V.graph.get_output_names())
-    removed_ops: list[Operation] = []
-    mutated_inputs: set[str] = set()
+    candidates: list[CopyBackCandidate] = []
 
     for copy_op in operations:
         if not (
@@ -1248,7 +1347,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
             continue
         if target_name in graph_outputs or source.name in graph_outputs:
             continue
-        if target_name in names_read or target_name in mutated_inputs:
+        if target_name in names_read:
             continue
 
         producer = writer_by_name.get(source.name)
@@ -1274,17 +1373,88 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
             continue
         if not _same_host_layout(producer.get_layout(), target.get_layout()):
             continue
+        if require_preallocated_layout_whitelist and not (
+            _producer_allows_preallocated_output_layout(producer)
+        ):
+            continue
 
         target_stl = _target_device_layout(target, target_name)
         if target_stl is None:
             continue
+
+        candidates.append(
+            CopyBackCandidate(
+                copy_op=copy_op,
+                source=source,
+                destination=destination,
+                target=target,
+                target_name=target_name,
+                target_stl=target_stl,
+                producer=producer,
+            )
+        )
+
+    return candidates
+
+
+def _mark_preallocated_output_layout_preferences(
+    operations: list[Operation],
+) -> None:
+    """Attach preferred destination STLs to safe, whitelisted copy-back producers.
+
+    The producer still exposes normal layout candidates later; this marker only
+    lets op-specific propagation decide whether the destination layout is legal
+    and how to rank it under the current policy.
+    """
+    candidates = _safe_copy_back_candidates(
+        operations, require_preallocated_layout_whitelist=True
+    )
+    target_counts = Counter(candidate.target_name for candidate in candidates)
+    source_counts = Counter(candidate.source.name for candidate in candidates)
+    for candidate in candidates:
+        if target_counts[candidate.target_name] != 1:
+            continue
+        if source_counts[candidate.source.name] != 1:
+            continue
+        candidate.producer._preallocated_output_stl = candidate.target_stl
+        candidate.producer._preallocated_output_layout = candidate.target.get_layout()
+        logger.info(
+            "marked %s to prefer preallocated output layout from %s",
+            candidate.producer.get_name(),
+            candidate.target_name,
+        )
+
+
+def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
+    """Commit safe lowering-marked copy-back candidates after layout selection.
+
+    Failed candidates remain normal copies.
+    """
+    removed_ops: list[Operation] = []
+    mutated_inputs: set[str] = set()
+
+    for candidate in _safe_copy_back_candidates(
+        operations, require_preallocated_layout_whitelist=False
+    ):
+        copy_op = candidate.copy_op
+        producer = candidate.producer
+        target_stl = candidate.target_stl
+        target_name = candidate.target_name
+
+        if target_name in mutated_inputs:
+            continue
+
         producer_layouts = getattr(producer, "layouts", None)
         if not producer_layouts or target_stl not in producer_layouts:
             continue
-        # Only elide when the producer has a single unambiguous layout. With
-        # multiple candidates the optimizer may not commit to target_stl, so
-        # eliding the copy would be incorrect.
-        if len(producer_layouts) != 1:
+        committed_stl = getattr(producer, "committed_stl", None)
+        if committed_stl is None:
+            # Before layout optimization has run, only elide if the producer has
+            # a single unambiguous layout.
+            if len(producer_layouts) != 1:
+                continue
+            committed_stl = target_stl
+        if committed_stl != target_stl:
             continue
 
         producer.layout = copy_op.layout
@@ -1304,6 +1474,11 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         for write in op.get_read_writes().writes:
             V.graph.removed_buffers.add(write.name)
         operations.remove(op)
+
+
+def resolve_copy_back_candidates(graph: GraphLowering) -> None:
+    """Graph pass wrapper for post-optimizer copy-back elision."""
+    _resolve_copy_back_candidates(graph.operations)
 
 
 def propagate_spyre_tensor_layouts(
@@ -1334,6 +1509,8 @@ def propagate_spyre_tensor_layouts(
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
                 tb.layouts = [stl]
+
+    _mark_preallocated_output_layout_preferences(operations)
 
     # Alt layout each graph input has been forced to by a mutation write, so a
     # second write can detect a conflicting alt.
