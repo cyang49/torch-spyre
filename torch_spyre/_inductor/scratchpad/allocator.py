@@ -37,6 +37,7 @@ from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
+    commit_core_mapping,
     concretize_expr,
     indirect_info_from_op,
     iteration_space_from_op,
@@ -1118,6 +1119,54 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     return CoreDivision(output_splits=dict(seed[0]), reduction_splits=dict(seed[1]))
 
 
+def _commit_op_core_mapping(op: Operation, coeff_splits: tuple[dict, dict]) -> None:
+    """Decode a coeff-keyed ``(output_splits, reduction_splits)`` division for
+    ``op`` and recompute+stash ``op.core_id_to_work_slice`` for it.
+
+    Mirrors ``work_division.apply_splits``'s call to ``commit_core_mapping``,
+    for the LX-planning commit sites that write ``op.op_it_space_splits``
+    directly instead of going through ``apply_splits``.
+    """
+    rw = op_read_writes(op)
+    write = next(iter(rw.writes), None)
+    if write is None:
+        return
+    write_index = write.index
+    first_read = next(iter(rw.reads), None)
+    read_index = first_read.index if first_read is not None else write_index
+    it_space = iteration_space_from_op(op)
+    dim_splits = apply_splits_from_index_coeff(
+        coeff_splits, write_index, read_index, it_space
+    )
+    commit_core_mapping(
+        op, dim_splits, write_index, read_index, is_matmul=_is_matmul_op(op)
+    )
+
+
+def _op_short_name(op: Any) -> str:
+    """Resolve an op's short name from its ``origin_node`` target, falling back
+    to each fused fx node in ``op.origins``; ``"None"`` when unresolvable.
+
+    ``origin_node`` is tried first (independent of ``origins``, which may be
+    empty), so a plain op still resolves; the ``origins`` fallback recovers a
+    fused op like bmm+permute, whose ``origin_node`` target has no resolvable
+    name and would otherwise resolve to ``"None"`` and be wrongly rejected as
+    "op not allowed". Module-level so ``ScratchpadAllocator._get_op_name``
+    delegates to one implementation.
+    """
+    name = None
+    for fx_node in (getattr(op, "origin_node", None), *getattr(op, "origins", ())):
+        target = getattr(fx_node, "target", None)
+        name = (
+            getattr(target, "_opname", None)
+            or getattr(target, "__name__", None)
+            or getattr(target, "name", None)
+        )
+        if name is not None:
+            break
+    return name if name is not None else "None"
+
+
 DEFAULT_VARIANT_CAP = 6
 
 
@@ -1504,6 +1553,199 @@ def _canonical_key(splits: tuple[dict, dict]) -> tuple:
     return (tuple(sorted(out.items())), tuple(sorted(red.items())))
 
 
+class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
+    """`Strategy B` assumes work_distribution committed one best option (seed). Here we
+    first add a few variants based on the seed, pick the combination that minimizes HBM
+    bytes among all, then defer to ScratchpadAllocator's flow. As seed is in the search
+    space, the worst case matches ScratchpadAllocator.
+    """
+
+    def plan_allocation(self, graph: GraphLowering):
+        self.reject_reasons = {}
+        for p in self.pre_optimization_passes:
+            p.apply_pass(graph)
+
+        # Enumerate options, run search, commit winners back to op_it_space_splits.
+        ops = graph.operations
+
+        # Distinct matmul output-splits (drop K) to seed the pointwise search.
+        matmul_bases, matmul_roles = _find_distinct_matmul_splits(ops)
+
+        options_per_op = [
+            _enum_split_options(op, matmul_bases, matmul_roles) for op in ops
+        ]
+        t1 = time.perf_counter()
+        best_chosen, timings, search_cache, search_lifetimes = self._search(
+            graph, ops, options_per_op
+        )
+        t_search = time.perf_counter() - t1
+
+        for op, opt_idx, options in zip(ops, best_chosen, options_per_op):
+            chosen = options[opt_idx]
+            if chosen != getattr(op, "op_it_space_splits", ({}, {})):
+                op.op_it_space_splits = chosen
+                _commit_op_core_mapping(op, chosen)
+
+        n_paths = math.prod(len(o) for o in options_per_op)
+        winner = {
+            f"{ops[i].get_name()}({self._get_op_name(ops[i])})": options_per_op[i][
+                best_chosen[i]
+            ]
+            for i in range(len(ops))
+            if len(options_per_op[i]) > 1
+        }
+        logger.info(
+            "co-opt search: %d paths in %.1fms (key components in "
+            "_generate_buffers(): residency %.1fms + mem_usage %.1fms); "
+            "winner=%s",
+            n_paths,
+            t_search * 1e3,
+            timings["residency"] * 1e3,
+            timings["mem_usage"] * 1e3,
+            winner,
+        )
+
+        # try insert clone again, as what was incompatible could be compatible now
+        # TODO simplify the previous pre-opt (at the beginning of this func), we will
+        # run check core-div-mismatch a few times due to clone-insertion, speed-up?
+        n_ops_before_clone = len(graph.operations)
+        for p in self.pre_optimization_passes:
+            p.apply_pass(graph)
+
+        # Standard downstream flow on the now-fixed winning splits. Mirrors
+        # ScratchpadAllocator.plan_allocation past the pre-passes. Reuse the search's
+        # per-core-view cache + liveness only if the clone pass left the graph
+        # unchanged: a clone insertion both appends an op (shifts the
+        # position-indexed liveness) and rewrites input consumers' MemoryDep to read
+        # the clone (changes the (op, splits, dep) cache key), so on any op-count
+        # change both are stale and we rebuild from scratch (cache=lifetimes=None).
+        clone_inserted = len(graph.operations) != n_ops_before_clone
+        buffers = self._generate_buffers(
+            graph,
+            cache=None if clone_inserted else search_cache,
+            lifetimes=None if clone_inserted else search_lifetimes,
+        )
+        assert self.layout_planning is not None
+        allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
+        self._record_spill_reasons(allocation)
+        self._push_allocation(graph, allocation)
+        self._log_lx_pinning(graph)
+        for p in self.post_optimization_passes:
+            p.apply_pass(graph)
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def _search(
+        self,
+        graph: GraphLowering,
+        ops: list[Operation],
+        options_per_op: list[list[tuple[dict, dict]]],
+    ) -> tuple[list[int], dict[str, float], dict, dict[str, list[int]]]:
+        """DFS over the option cross-product, scoring each leaf via
+        _score_layout. Returns (best option index per op, timing breakdown in
+        seconds, _per_core_view_on_buf cache, liveness). The timing dict has
+        keys `residency` and `mem_usage` — the two split-dependent
+        shared-object builds inside _generate_buffers, which dominate per-leaf
+        cost. Liveness is split-invariant and computed once here, not per leaf.
+        No early-stop pruning — bounded by ≤ K^N leaves where N counts ops with
+        >1 option (most return [seed]). Per-leaf cost is one full
+        _generate_buffers + plan_layout pass; the `cache` param on
+        _per_core_view_on_buf amortizes sympy work if it ever becomes hot. The
+        cache and liveness are returned so the final commit pass can reuse them
+        when the post-search clone pass leaves the graph unchanged (see
+        plan_allocation).
+        """
+        chosen: list[int] = [0] * len(ops)
+        best_total: float = math.inf
+        best_chosen: list[int] = list(chosen)
+        timings: dict[str, float] = {
+            "residency": 0.0,
+            "mem_usage": 0.0,
+        }
+
+        buf_total_bytes: dict[str, int] = {
+            name: math.prod(buf.layout.device_layout.device_size[:-1]) * 128
+            for name, buf in graph.name_to_buffer.items()
+        }
+
+        # get_read_writes() re-traces the store function over the iteration space
+        # on every call and is NOT memoized upstream, yet its result is
+        # split-invariant (the symbolic deps don't depend on op_it_space_splits).
+        # The per-leaf residency/get_ncores path calls it for every op, so across
+        # ~K^N leaves it would dominate — but `op_read_writes` memoizes it per op
+        # instance (split-invariant), so the first leaf warms the cache for all.
+
+        # Liveness depends only on graph structure (not op.op_it_space_splits),
+        # so compute it once for the whole search instead of per leaf.
+        lifetimes = calculate_liveness(graph)
+
+        # Memoize _per_core_view_on_buf across leaves. Keyed on
+        # (op name, split values, dep) — see _per_core_view_on_buf for why
+        # op name is required. A single dict is correct across the whole
+        # search; scoped to this graph only since dep is not unique across
+        # graphs.
+        cache: dict = {}
+
+        def recurse(op_idx: int) -> None:
+            nonlocal best_total, best_chosen
+            if op_idx == len(ops):
+                hbm = self._score_layout(
+                    graph, buf_total_bytes, cache, timings, lifetimes
+                )
+                if hbm < best_total:
+                    best_total = hbm
+                    best_chosen = list(chosen)  # list() makes a copy
+                return
+
+            op = ops[op_idx]
+            options = options_per_op[op_idx]
+
+            # Mutate-and-undo: stash and restore op.op_it_space_splits.
+            # If the op originally lacked the attribute, restore it as
+            # ({}, {}) — equivalent to "unset" for all readers (which use
+            # getattr(..., ({}, {})) or hasattr+empty-dict default).
+            prev_split: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+            for opt_idx, option in enumerate(options):
+                op.op_it_space_splits = option
+                chosen[op_idx] = opt_idx
+                recurse(op_idx + 1)
+            op.op_it_space_splits = prev_split
+
+        recurse(0)
+        return best_chosen, timings, cache, lifetimes
+
+    # ------------------------------------------------------------------
+    # Leaf scoring
+    # ------------------------------------------------------------------
+
+    def _score_layout(
+        self,
+        graph: GraphLowering,
+        buf_total_bytes: dict[str, int],
+        cache: Optional[dict] = None,
+        timings: Optional[dict[str, float]] = None,
+        lifetimes: Optional[dict[str, list[int]]] = None,
+    ) -> int:
+        """HBM bytes under the current split assignment: total device
+        bytes of every buffer the solver couldn't pin. Non-committing
+        (addresses land on throwaway buffers) and solver-agnostic.
+
+        If `timings` is provided, _generate_buffers accumulates its
+        `residency` / `mem_usage` sub-step seconds into it. `lifetimes`
+        (split-invariant) is forwarded to avoid recomputing it per leaf.
+        """
+        buffers = self._generate_buffers(graph, cache, timings, lifetimes)
+        assert self.layout_planning is not None
+        allocation = self.layout_planning.plan_layout(buffers)
+        pinned_names = {b.name for b in allocation if b.address is not None}
+
+        return sum(
+            total for name, total in buf_total_bytes.items() if name not in pinned_names
+        )
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -1683,10 +1925,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if op is None or buf.chosen_division is None:
                 continue
             cd = buf.core_divisions[buf.chosen_division]
-            op.op_it_space_splits = (
-                dict(cd.output_splits),
-                dict(cd.reduction_splits),
-            )
+            coeff_splits = (dict(cd.output_splits), dict(cd.reduction_splits))
+            op.op_it_space_splits = coeff_splits
+            _commit_op_core_mapping(op, coeff_splits)
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
