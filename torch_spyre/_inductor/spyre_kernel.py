@@ -1722,22 +1722,23 @@ def _restickify_restore_elided_dim(op_spec) -> None:
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # Both parameters must be provided together for gather kernels — indirect_sizes
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
-
     if op_spec.op == RESTICKIFY_OP:
         # Restore a restickify's elided size-1 stick, creating a shared iteration
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
 
     it_space = op_spec.iteration_space
-    new_op_space_splits, new_tensors, work_division_remap = align_tensors(
+    new_op_space_splits, new_tensors, work_division_remap, new_core_id_to_work_slice = align_tensors(
         it_space,
         [
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
             for arg in op_spec.args
         ],
         indirect_sizes,
+        op_spec.core_id_to_work_slice,
     )
     op_spec.iteration_space = new_op_space_splits
+    op_spec.core_id_to_work_slice = new_core_id_to_work_slice
 
     for arg, t in zip(op_spec.args, new_tensors):
         _remap_work_division(arg, work_division_remap)

@@ -2129,6 +2129,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             if _k_sym in dim_splits:
                 dim_splits[_k_sym] = 1
                 work_slices[_k_sym] = 1
+                core_id_to_work_slice[_k_sym] = Integer(0)
         num_cores = math.prod(dim_splits.values())
 
     if is_conv:
