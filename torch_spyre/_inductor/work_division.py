@@ -753,11 +753,10 @@ def apply_splits(
 ) -> None:
     """Commit splits to op.
 
-    Does nothing when the product of splits is 1 (no parallelism).
+    Always commits core_id_to_work_slice (even for single-core ops, which get
+    all-unsplit mappings). Only commits op_it_space_splits when parallelized.
     """
     cores_used = math.prod(splits.values())
-    if cores_used <= 1:
-        return
 
     rw = op_read_writes(op)
     write_index = output_td.dep.index
@@ -774,11 +773,15 @@ def apply_splits(
             if best_read is not None:
                 read_index = best_read
 
-    op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
+    # Always commit core ownership, including single-core operations.
     commit_core_mapping(
         op, splits, write_index, read_index, is_matmul=_is_matmul_op(op)
     )
 
+    if cores_used <= 1:
+        return
+
+    op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 def enumerate_work_division_candidates(
     op: ComputedBuffer,
