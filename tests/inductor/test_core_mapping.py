@@ -17,9 +17,7 @@ import math
 import pytest
 import sympy
 
-from torch_spyre._C import DataFormats
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
-from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 
 def _coordinates(splits, num_cores, **kwargs):
@@ -27,7 +25,7 @@ def _coordinates(splits, num_cores, **kwargs):
     mapping = core_to_slice_mapping(dims, splits, num_cores, **kwargs)
     core_id = sympy.Symbol("core_id")
     return [
-        tuple(int(mapping[str(dim)].subs(core_id, core)) for dim in dims)
+        tuple(int(mapping[dim].subs(core_id, core)) for dim in dims)
         for core in range(num_cores)
     ]
 
@@ -54,51 +52,4 @@ def test_selected_dim_varies_first(contiguous_dim):
         for coordinate in coordinates[: splits[contiguous_dim]]
         for dim in range(len(splits))
         if dim != contiguous_dim
-    )
-
-
-def _bmm_op_spec(op: str) -> OpSpec:
-    mb, out, reduction = sympy.symbols("mb out reduction")
-    args = [
-        TensorArg(
-            True,
-            0,
-            DataFormats.SEN169_FP16,
-            [512, 64, 1, 64],
-            [
-                mb,
-                sympy.floor(reduction / 64),
-                sympy.Integer(0),
-                sympy.Mod(reduction, 64),
-            ],
-            {"hbm": 0},
-        ),
-        TensorArg(
-            True,
-            1,
-            DataFormats.SEN169_FP16,
-            [200, 4096, 64],
-            [sympy.floor(out / 64), reduction, sympy.Mod(out, 64)],
-            {"hbm": 0x400000000},
-        ),
-        TensorArg(
-            False,
-            2,
-            DataFormats.SEN169_FP16,
-            [512, 200, 1, 64],
-            [
-                mb,
-                sympy.floor(out / 64),
-                sympy.Integer(0),
-                sympy.Mod(out, 64),
-            ],
-            {"hbm": 0x800000000},
-        ),
-    ]
-    return OpSpec(
-        op,
-        True,
-        {mb: (512, 2), out: (12800, 4), reduction: (4096, 4)},
-        args,
-        {},
     )
