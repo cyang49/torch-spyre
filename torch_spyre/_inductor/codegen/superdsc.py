@@ -1825,16 +1825,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # pass last committed op.op_it_space_splits (work division, or LX
     # planning's re-division) -- see pass_utils.commit_core_mapping. Translate
     # it from scheduler symbols to SDSC-renamed symbols via symbol_mapping.
-    # Indirect access forces every dim_splits/work_slices entry to 1 above, so
-    # mirror that here rather than trusting a mapping computed against real
-    # splits.
-    if has_indirect_access:
-        core_id_to_work_slice = dict.fromkeys(symbol_mapping.values(), Integer(0))
-    else:
-        core_id_to_work_slice = {
-            symbol_mapping[sym]: slice_expr
-            for sym, slice_expr in op_spec.core_id_to_work_slice.items()
-        }
+    # Indirect access does not change ownership; zeroing this map aliases every
+    # work slice to core zero.
+    core_id_to_work_slice = {
+        symbol_mapping[sym]: slice_expr
+        for sym, slice_expr in op_spec.core_id_to_work_slice.items()
+    }
 
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
