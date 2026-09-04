@@ -16,7 +16,6 @@
 
 import torch
 
-
 REQUIRE_LAYOUT_KEY = "require_layout"
 
 
@@ -28,8 +27,8 @@ _VIEW_OPS = {
 }
 
 
-def _matmul_producer(source: torch.fx.Node) -> torch.fx.Node:
-    """Walk output-only views back to their BMM/MM producer."""
+def _producer(source: torch.fx.Node) -> torch.fx.Node:
+    """Walk output-only views back to producer that must emit requested layout."""
     while source.target in _VIEW_OPS:
         source = source.args[0]
         if not isinstance(source, torch.fx.Node):
@@ -38,7 +37,7 @@ def _matmul_producer(source: torch.fx.Node) -> torch.fx.Node:
 
 
 def apply_require_layout(graph: torch.fx.Graph) -> None:
-    """Move static marker layout request onto its matmul producer, then erase it."""
+    """Move static marker layout request onto producer, then erase marker."""
     for node in list(graph.nodes):
         if node.target != torch.ops.spyre.require_layout.default:
             continue
@@ -47,10 +46,12 @@ def apply_require_layout(graph: torch.fx.Graph) -> None:
             raise TypeError("require_layout expects a tensor producer")
         if not all(isinstance(v, int) for v in (*device_size, *stride_map)):
             raise TypeError("require_layout layout must be static")
-        source = _matmul_producer(source)
-        source.meta.setdefault("custom", {})[REQUIRE_LAYOUT_KEY] = (
-            list(device_size),
-            list(stride_map),
-        )
+        source = _producer(source)
+        custom = source.meta.setdefault("custom", {})
+        request = (list(device_size), list(stride_map))
+        previous = custom.get(REQUIRE_LAYOUT_KEY)
+        if previous is not None and previous != request:
+            raise ValueError("conflicting require_layout requests for one producer")
+        custom[REQUIRE_LAYOUT_KEY] = request
         node.replace_all_uses_with(node.args[0])
         graph.erase_node(node)
