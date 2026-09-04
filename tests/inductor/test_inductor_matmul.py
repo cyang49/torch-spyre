@@ -13,6 +13,9 @@
 # limitations under the License.
 import pytest
 import torch
+from torch._inductor.utils import run_and_get_code
+from torch_spyre import require_layout
+from torch.spyre import SpyreTensorLayout
 from utils_inductor import compare_with_cpu
 
 
@@ -93,3 +96,26 @@ class TestMatmulOps:
         _compare_modes(
             execution_mode, fn, *(eye, a) if left else (a, eye), atol=atol, rtol=rtol
         )
+
+
+class TestRequireLayout:
+    def test_bmm_emits_requested_output_layout(self):
+        x = torch.randn(1, 128, 256, dtype=torch.float16)
+        weight = torch.randn(256, 512, dtype=torch.float16)
+        target = SpyreTensorLayout(
+            [1, 128, 512], [65536, 512, 1], torch.float16, [1, 0, 2]
+        )
+
+        def fn(a, b):
+            return require_layout(torch.matmul(a, b), target)
+
+        result, source_codes = run_and_get_code(
+            torch.compile(fn), x.to("spyre"), weight.to("spyre")
+        )
+        torch.testing.assert_close(
+            result.cpu(), torch.matmul(x, weight), atol=0.2, rtol=0.1
+        )
+        self_layout = result.device_tensor_layout()
+        assert self_layout is not None
+        assert self_layout == target
+        assert "device_size=[1, 8, 128, 64]" in source_codes[0]

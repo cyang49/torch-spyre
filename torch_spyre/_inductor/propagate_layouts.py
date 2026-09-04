@@ -22,6 +22,7 @@ import math
 import sympy
 import torch
 from .logging_utils import get_inductor_logger
+from .layout_hints import REQUIRE_LAYOUT_KEY
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,
@@ -1040,6 +1041,23 @@ def find_stick_compatible_input_layout(
     )
 
 
+def _required_layout_stl(op: Operation, dtype: torch.dtype):
+    """Return BMM output STL requested by ``require_layout``, if any."""
+    request = None
+    for fx_node in getattr(op, "origins", ()):
+        custom = (fx_node.meta or {}).get("custom") or {}
+        candidate = custom.get(REQUIRE_LAYOUT_KEY)
+        if candidate is None:
+            continue
+        if request is not None and request != candidate:
+            raise Unsupported(f"{op.get_name()}: conflicting require_layout requests")
+        request = candidate
+    if request is None:
+        return None
+    device_size, stride_map = request
+    return SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
+
+
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1112,6 +1130,7 @@ def _matmul_layouts(
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var((x.dep,), output_dep)
+    generated_var = None
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
 
