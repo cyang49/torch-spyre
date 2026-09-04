@@ -14,9 +14,10 @@
 import pytest
 import torch
 from torch._inductor.utils import run_and_get_code
-from torch_spyre import require_layout
 from torch.spyre import SpyreTensorLayout
 from utils_inductor import compare_with_cpu
+
+from torch_spyre import require_layout
 
 
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
@@ -99,6 +100,13 @@ class TestMatmulOps:
 
 
 class TestRequireLayout:
+    @pytest.mark.parametrize("dtype", [torch.bool, torch.float64, torch.int64])
+    def test_rejects_unsupported_dtype(self, dtype):
+        x = torch.ones(1, dtype=dtype)
+
+        with pytest.raises(ValueError, match="require_layout supports"):
+            require_layout(x, None)
+
     def test_bmm_emits_requested_output_layout(self):
         x = torch.randn(1, 128, 256, dtype=torch.float16)
         weight = torch.randn(256, 512, dtype=torch.float16)
@@ -119,3 +127,16 @@ class TestRequireLayout:
         assert self_layout is not None
         assert self_layout == target
         assert "device_size=[1, 8, 128, 64]" in source_codes[0]
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_pointwise_emits_requested_output_layout(self, dtype):
+        x = torch.randn(2, 128, dtype=dtype)
+        x_spyre = x.to("spyre")
+        target = x_spyre.device_tensor_layout()
+
+        result, _ = run_and_get_code(
+            torch.compile(lambda a: require_layout(a + 1, target)), x_spyre
+        )
+
+        assert result.device_tensor_layout() == target
+        torch.testing.assert_close(result.cpu(), x + 1, atol=0.2, rtol=0.1)
