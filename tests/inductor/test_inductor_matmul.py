@@ -105,7 +105,7 @@ class TestRequireLayout:
         x = torch.ones(1, dtype=dtype)
 
         with pytest.raises(ValueError, match="require_layout supports"):
-            require_layout(x, None)
+            require_layout(x, [], [])
 
     def test_bmm_emits_requested_output_layout(self):
         x = torch.randn(1, 128, 256, dtype=torch.float16)
@@ -114,8 +114,11 @@ class TestRequireLayout:
             [1, 128, 512], [65536, 512, 1], torch.float16, [1, 0, 2]
         )
 
+        device_size = list(target.device_size)
+        stride_map = list(target.stride_map)
+
         def fn(a, b):
-            return require_layout(torch.matmul(a, b), target)
+            return require_layout(torch.matmul(a, b), device_size, stride_map)
 
         result, source_codes = run_and_get_code(
             torch.compile(fn), x.to("spyre"), weight.to("spyre")
@@ -135,8 +138,59 @@ class TestRequireLayout:
         target = x_spyre.device_tensor_layout()
 
         result, _ = run_and_get_code(
-            torch.compile(lambda a: require_layout(a + 1, target)), x_spyre
+            torch.compile(
+                lambda a: require_layout(
+                    a + 1, list(target.device_size), list(target.stride_map)
+                )
+            ),
+            x_spyre,
         )
 
         assert result.device_tensor_layout() == target
         torch.testing.assert_close(result.cpu(), x + 1, atol=0.2, rtol=0.1)
+
+    def test_view_chain_emits_requested_bmm_layout(self):
+        x = torch.randn(1, 128, 256, dtype=torch.float16)
+        weight = torch.randn(256, 512, dtype=torch.float16)
+        target = SpyreTensorLayout(
+            [1, 128, 512], [65536, 512, 1], torch.float16, [1, 0, 2]
+        )
+
+        device_size = list(target.device_size)
+        stride_map = list(target.stride_map)
+
+        def fn(a, b):
+            return require_layout(
+                torch.matmul(a, b).view(1, 128, 512), device_size, stride_map
+            )
+
+        result = torch.compile(fn)(x.to("spyre"), weight.to("spyre"))
+
+        assert result.device_tensor_layout() == target
+
+    def test_rejects_eager_execution(self):
+        x = torch.randn(2, 128, dtype=torch.float16).to("spyre")
+
+        with pytest.raises(RuntimeError, match="only inside torch.compile"):
+            require_layout(x, [2, 2, 64], [128, 64, 1])
+
+    def test_conflicting_requests_fail(self):
+        x = torch.randn(1, 128, 256, dtype=torch.float16)
+        weight = torch.randn(256, 512, dtype=torch.float16)
+
+        def fn(a, b):
+            output = torch.matmul(a, b)
+            first = require_layout(output, [1, 8, 128, 64], [65536, 64, 512, 1])
+            second = require_layout(output, [1, 8, 128, 64], [65536, 512, 64, 1])
+            return first + second
+
+        with pytest.raises(Exception, match="conflicting require_layout"):
+            torch.compile(fn)(x.to("spyre"), weight.to("spyre"))
+
+    def test_unsupported_producer_fails(self):
+        x = torch.randn(2, 128, dtype=torch.float16).to("spyre")
+
+        with pytest.raises(Exception, match="no supported compiled producer"):
+            torch.compile(
+                lambda a: require_layout(torch.sin(a), [2, 2, 64], [128, 64, 1])
+            )(x)

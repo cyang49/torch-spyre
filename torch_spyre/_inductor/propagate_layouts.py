@@ -1054,7 +1054,8 @@ def _required_layout_stl(op: Operation, dtype: torch.dtype):
         request = candidate
     if request is None:
         return None
-    device_size, stride_map = request
+    request["consumed"] = True
+    device_size, stride_map = request["geometry"]
     return SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
 
 
