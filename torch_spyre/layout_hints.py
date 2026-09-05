@@ -48,6 +48,8 @@ def require_layout(
         raise ValueError("require_layout device_size extents must be positive")
     if any(stride < -1 for stride in stride_map):
         raise ValueError("require_layout stride_map values must be at least -1")
+    if stride_map[-1] != 1:
+        raise ValueError("require_layout output stride_map must end in 1")
     positive_strides = [stride for stride in stride_map if stride > 0]
     if len(set(positive_strides)) != len(positive_strides):
         raise ValueError("require_layout output stride_map must be injective")
