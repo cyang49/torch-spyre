@@ -1041,8 +1041,39 @@ def find_stick_compatible_input_layout(
     )
 
 
-def _required_layout_stl(op: Operation, dtype: torch.dtype):
-    """Return BMM output STL requested by ``require_layout``, if any."""
+def _coordinate_upper_bound(expr: sympy.Expr, ranges: dict) -> int:
+    """Return a conservative upper bound for a nonnegative coordinate."""
+    if expr.is_Integer:
+        return int(expr)
+    if expr.is_Symbol:
+        return concretize_expr(ranges[expr]) - 1
+    if isinstance(expr, sympy.Add):
+        return sum(_coordinate_upper_bound(arg, ranges) for arg in expr.args)
+    if isinstance(expr, sympy.Mul):
+        coefficient, term = expr.as_coeff_Mul()
+        if coefficient < 0:
+            raise Unsupported(f"negative require_layout coordinate {expr}")
+        return int(coefficient) * _coordinate_upper_bound(term, ranges)
+    if expr.func is sympy.Mod:
+        base, modulus = expr.args
+        if not modulus.is_Integer or modulus <= 0:
+            raise Unsupported(f"invalid require_layout coordinate {expr}")
+        return min(_coordinate_upper_bound(base, ranges), int(modulus) - 1)
+    if expr.func.__name__ in ("FloorDiv", "floor"):
+        if expr.func.__name__ == "floor":
+            base, divisor = expr.args[0].as_numer_denom()
+        else:
+            base, divisor = expr.args
+        if not divisor.is_Integer or divisor <= 0:
+            raise Unsupported(f"invalid require_layout coordinate {expr}")
+        return _coordinate_upper_bound(base, ranges) // int(divisor)
+    raise Unsupported(f"unsupported require_layout coordinate {expr}")
+
+
+def _required_layout_stl(
+    op: Operation, dtype: torch.dtype, output: FixedLayout, output_dep: MemoryDep
+):
+    """Return validated output STL requested by ``require_layout``, if any."""
     requests = []
     for fx_node in getattr(op, "origins", ()):
         custom = (fx_node.meta or {}).get("custom") or {}
@@ -1059,9 +1090,24 @@ def _required_layout_stl(op: Operation, dtype: torch.dtype):
         extent <= 0 for extent in device_size
     ):
         raise Unsupported(f"{op.get_name()}: invalid require_layout geometry")
+    stl = SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
+    if device_size[-1] != stl.elems_per_stick():
+        raise Unsupported(f"{op.get_name()}: require_layout has invalid stick extent")
+    if math.prod(device_size) < math.prod(
+        concretize_expr(size) for size in output.size
+    ):
+        raise Unsupported(f"{op.get_name()}: require_layout cannot hold output")
+    coordinates = try_device_coordinates(stl, output_dep, None)
+    if coordinates is None or any(
+        _coordinate_upper_bound(coord, output_dep.ranges) >= extent
+        for coord, extent in zip(coordinates, device_size)
+    ):
+        raise Unsupported(
+            f"{op.get_name()}: require_layout coordinates exceed geometry"
+        )
     for request in requests:
         request["consumed"] = True
-    return SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
+    return stl
 
 
 def _matmul_layouts(
@@ -1208,7 +1254,7 @@ def _matmul_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
 
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    requested_stl = _required_layout_stl(op, output.dtype)
+    requested_stl = _required_layout_stl(op, output.dtype, output, output_dep)
     if requested_stl is not None:
         requested_coords = try_device_coordinates(requested_stl, output_dep, None)
         if (
@@ -1809,7 +1855,7 @@ def _require_pointwise_layout(
     layouts: list[SpyreTensorLayout],
 ) -> list[SpyreTensorLayout]:
     """Restrict a pointwise producer to its requested direct-output layout."""
-    requested_stl = _required_layout_stl(op, output.dtype)
+    requested_stl = _required_layout_stl(op, output.dtype, output, output_dep)
     if requested_stl is None:
         return layouts
     requested_coords = try_device_coordinates(requested_stl, output_dep, None)
@@ -2522,7 +2568,10 @@ def propagate_spyre_tensor_layouts(
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
             if not args:
-                if _required_layout_stl(op, output.dtype) is not None:
+                if any(
+                    (fx_node.meta or {}).get("custom", {}).get(REQUIRE_LAYOUT_KEY)
+                    for fx_node in getattr(op, "origins", ())
+                ):
                     raise Unsupported(
                         f"{op.get_name()}: require_layout needs a producer with tensor inputs"
                     )

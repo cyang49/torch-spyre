@@ -187,6 +187,20 @@ class TestRequireLayout:
         with pytest.raises(Exception, match="conflicting require_layout"):
             torch.compile(fn)(x.to("spyre"), weight.to("spyre"))
 
+    def test_equal_requests_on_fused_producers(self):
+        x = torch.randn(2, 128, dtype=torch.float16).to("spyre")
+        target = x.device_tensor_layout()
+        device_size = list(target.device_size)
+        stride_map = list(target.stride_map)
+
+        def fn(a):
+            left = require_layout(a + 1, device_size, stride_map)
+            right = require_layout(a + 2, device_size, stride_map)
+            return left + right
+
+        result = torch.compile(fn)(x)
+        torch.testing.assert_close(result.cpu(), x.cpu() * 2 + 3, atol=0.2, rtol=0.1)
+
     @pytest.mark.parametrize(
         "fn",
         [
@@ -205,6 +219,7 @@ class TestRequireLayout:
         [
             ([2, 2], [128], "equal nonzero lengths"),
             ([2, 0, 64], [128, 64, 1], "extents must be positive"),
+            ([1, 2, 64], [128, 64, 1], "cannot hold tensor output"),
         ],
     )
     def test_rejects_invalid_geometry(self, device_size, stride_map, error):
