@@ -187,10 +187,28 @@ class TestRequireLayout:
         with pytest.raises(Exception, match="conflicting require_layout"):
             torch.compile(fn)(x.to("spyre"), weight.to("spyre"))
 
-    def test_unsupported_producer_fails(self):
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            lambda a: torch.sin(a),
+            lambda a: a.sum(dim=-1),
+        ],
+    )
+    def test_unsupported_producer_fails(self, fn):
         x = torch.randn(2, 128, dtype=torch.float16).to("spyre")
 
         with pytest.raises(Exception, match="no supported compiled producer"):
-            torch.compile(
-                lambda a: require_layout(torch.sin(a), [2, 2, 64], [128, 64, 1])
-            )(x)
+            torch.compile(lambda a: require_layout(fn(a), [2, 2, 64], [128, 64, 1]))(x)
+
+    @pytest.mark.parametrize(
+        "device_size,stride_map,error",
+        [
+            ([2, 2], [128], "equal nonzero lengths"),
+            ([2, 0, 64], [128, 64, 1], "extents must be positive"),
+        ],
+    )
+    def test_rejects_invalid_geometry(self, device_size, stride_map, error):
+        x = torch.randn(2, 128, dtype=torch.float16).to("spyre")
+
+        with pytest.raises(Exception, match=error):
+            torch.compile(lambda a: require_layout(a + 1, device_size, stride_map))(x)

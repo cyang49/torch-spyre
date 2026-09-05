@@ -38,6 +38,12 @@ def require_layout(
     """
     if x.dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"require_layout supports {_SUPPORTED_DTYPES}; got {x.dtype}")
+    if len(device_size) != len(stride_map) or not device_size:
+        raise ValueError(
+            "require_layout device_size and stride_map must have equal nonzero lengths"
+        )
+    if any(extent <= 0 for extent in device_size):
+        raise ValueError("require_layout device_size extents must be positive")
     if not torch.compiler.is_compiling():
         raise RuntimeError("require_layout is available only inside torch.compile")
     return torch.ops.spyre.require_layout(x, list(device_size), list(stride_map))

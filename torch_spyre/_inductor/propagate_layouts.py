@@ -1043,19 +1043,24 @@ def find_stick_compatible_input_layout(
 
 def _required_layout_stl(op: Operation, dtype: torch.dtype):
     """Return BMM output STL requested by ``require_layout``, if any."""
-    request = None
+    requests = []
     for fx_node in getattr(op, "origins", ()):
         custom = (fx_node.meta or {}).get("custom") or {}
         candidate = custom.get(REQUIRE_LAYOUT_KEY)
-        if candidate is None:
-            continue
-        if request is not None and request != candidate:
-            raise Unsupported(f"{op.get_name()}: conflicting require_layout requests")
-        request = candidate
-    if request is None:
+        if candidate is not None:
+            requests.append(candidate)
+    if not requests:
         return None
-    request["consumed"] = True
-    device_size, stride_map = request["geometry"]
+    geometry = requests[0]["geometry"]
+    if any(candidate["geometry"] != geometry for candidate in requests[1:]):
+        raise Unsupported(f"{op.get_name()}: conflicting require_layout requests")
+    device_size, stride_map = geometry
+    if len(device_size) != len(stride_map) or any(
+        extent <= 0 for extent in device_size
+    ):
+        raise Unsupported(f"{op.get_name()}: invalid require_layout geometry")
+    for request in requests:
+        request["consumed"] = True
     return SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
 
 
@@ -1911,7 +1916,9 @@ def compute_layouts(
             f"output size={output.size}"
         )
     op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep, op)
-    return _require_pointwise_layout(op, output, output_dep, args, layouts)
+    if isinstance(data, Pointwise):
+        return _require_pointwise_layout(op, output, output_dep, args, layouts)
+    return layouts
 
 
 def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
