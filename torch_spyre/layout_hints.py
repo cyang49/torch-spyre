@@ -14,6 +14,8 @@
 
 """Compiler-directed tensor-layout hints."""
 
+import math
+
 import torch
 
 
@@ -44,6 +46,10 @@ def require_layout(
         )
     if any(extent <= 0 for extent in device_size):
         raise ValueError("require_layout device_size extents must be positive")
+    if any(stride == 0 for stride in stride_map):
+        raise ValueError("require_layout output stride_map cannot broadcast")
+    if math.prod(device_size) < x.numel():
+        raise ValueError("require_layout geometry cannot hold tensor output")
     if not torch.compiler.is_compiling():
         raise RuntimeError("require_layout is available only inside torch.compile")
     return torch.ops.spyre.require_layout(x, list(device_size), list(stride_map))
