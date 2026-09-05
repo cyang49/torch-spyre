@@ -17,6 +17,7 @@
 import torch
 
 REQUIRE_LAYOUT_KEY = "require_layout"
+REQUESTS_KEY = "_spyre_require_layout_requests"
 
 
 _VIEW_OPS = {
@@ -37,7 +38,8 @@ def _producer(source: torch.fx.Node) -> torch.fx.Node:
 
 
 def apply_require_layout(graph: torch.fx.Graph) -> None:
-    """Move static marker layout request onto producer, then erase marker."""
+    """Move static marker request onto producer and track its consumption."""
+    requests = graph.__dict__.setdefault(REQUESTS_KEY, {})
     for node in list(graph.nodes):
         if node.target != torch.ops.spyre.require_layout.default:
             continue
@@ -48,10 +50,21 @@ def apply_require_layout(graph: torch.fx.Graph) -> None:
             raise TypeError("require_layout layout must be static")
         source = _producer(source)
         custom = source.meta.setdefault("custom", {})
-        request = (list(device_size), list(stride_map))
+        geometry = (list(device_size), list(stride_map))
         previous = custom.get(REQUIRE_LAYOUT_KEY)
-        if previous is not None and previous != request:
+        if previous is not None and previous["geometry"] != geometry:
             raise ValueError("conflicting require_layout requests for one producer")
-        custom[REQUIRE_LAYOUT_KEY] = request
+        if previous is None:
+            request = {"geometry": geometry, "consumed": False}
+            requests[id(request)] = request
+            custom[REQUIRE_LAYOUT_KEY] = request
         node.replace_all_uses_with(node.args[0])
         graph.erase_node(node)
+
+
+def assert_require_layout_consumed(graph) -> None:
+    """Reject hints not honored by a layout-aware producer in this graph."""
+    requests = graph.graph.__dict__.get(REQUESTS_KEY, {})
+    pending = [request for request in requests.values() if not request["consumed"]]
+    if pending:
+        raise RuntimeError("require_layout target has no supported compiled producer")
