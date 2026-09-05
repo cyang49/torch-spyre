@@ -16,6 +16,8 @@
 
 import torch
 
+from .errors import Unsupported
+
 REQUIRE_LAYOUT_KEY = "require_layout"
 REQUESTS_KEY = "_spyre_require_layout_requests"
 
@@ -48,6 +50,12 @@ def apply_require_layout(graph: torch.fx.Graph) -> None:
             raise TypeError("require_layout expects a tensor producer")
         if not all(isinstance(v, int) for v in (*device_size, *stride_map)):
             raise TypeError("require_layout layout must be static")
+        if len(device_size) != len(stride_map) or not device_size:
+            raise ValueError(
+                "require_layout device_size and stride_map must have equal nonzero lengths"
+            )
+        if any(extent <= 0 for extent in device_size):
+            raise ValueError("require_layout device_size extents must be positive")
         source = _producer(source)
         custom = source.meta.setdefault("custom", {})
         geometry = (list(device_size), list(stride_map))
@@ -67,4 +75,4 @@ def assert_require_layout_consumed(graph) -> None:
     requests = graph.graph.__dict__.get(REQUESTS_KEY, {})
     pending = [request for request in requests.values() if not request["consumed"]]
     if pending:
-        raise RuntimeError("require_layout target has no supported compiled producer")
+        raise Unsupported("require_layout target has no supported compiled producer")

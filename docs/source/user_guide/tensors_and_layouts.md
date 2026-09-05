@@ -430,10 +430,9 @@ SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], 
 
 `torch_spyre.require_layout(tensor, device_size, stride_map)` requests that a
 compiled producer emit a physical layout directly. It supports
-`torch.matmul`/`mm`/`bmm` and tensor `add`, `sub`, `mul`, and `div` producers,
-including output-only `expand`/`reshape`/`view` chains. Unsupported producers
-or illegal direct layouts fail compilation; this is not an `out=` storage
-destination.
+matmul producers and eligible pointwise producers, including output-only
+`expand`/`reshape`/`view` chains. Unsupported producers or illegal direct
+layouts fail compilation; this is not an `out=` storage destination.
 
 `device_size` and `stride_map` are static integer lists. The compiled output
 uses the producer dtype and `ElementArrangement.STANDARD`; therefore non-standard
