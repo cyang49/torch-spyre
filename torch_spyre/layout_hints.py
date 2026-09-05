@@ -33,10 +33,10 @@ def require_layout(
       stride_map: Static logical strides corresponding to ``device_size``.
 
     This compiler-only constraint uses ``x.dtype`` and
-    ``ElementArrangement.STANDARD``. It supports matmul and tensor
-    add/sub/mul/div producers, including output-only view chains. Unsupported
-    producers or illegal geometry raise during compilation. For eager conversion
-    or non-STANDARD layouts, use ``x.to(device_layout=layout)`` instead.
+    ``ElementArrangement.STANDARD``. It supports matmul and eligible pointwise
+    producers, including output-only view chains. Unsupported producers or
+    illegal geometry raise during compilation. For eager conversion or
+    non-STANDARD layouts, use ``x.to(device_layout=layout)`` instead.
     """
     if x.dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"require_layout supports {_SUPPORTED_DTYPES}; got {x.dtype}")
@@ -46,6 +46,11 @@ def require_layout(
         )
     if any(extent <= 0 for extent in device_size):
         raise ValueError("require_layout device_size extents must be positive")
+    if any(stride < -1 for stride in stride_map):
+        raise ValueError("require_layout stride_map values must be at least -1")
+    positive_strides = [stride for stride in stride_map if stride > 0]
+    if len(set(positive_strides)) != len(positive_strides):
+        raise ValueError("require_layout output stride_map must be injective")
     if any(stride == 0 for stride in stride_map):
         raise ValueError("require_layout output stride_map cannot broadcast")
     if math.prod(device_size) < x.numel():
