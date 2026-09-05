@@ -221,6 +221,9 @@ class TestRequireLayout:
             ([2, 0, 64], [128, 64, 1], "extents must be positive"),
             ([1, 2, 64], [128, 64, 1], "cannot hold tensor output"),
             ([2, 2, 64], [128, 64, -1], "must end in 1"),
+            ([2, 2, 64], [128, 0, 1], "cannot broadcast"),
+            ([2, 2, 64], [-2, 64, 1], "must be at least -1"),
+            ([2, 2, 64], [64, 64, 1], "must be injective"),
         ],
     )
     def test_rejects_invalid_geometry(self, device_size, stride_map, error):

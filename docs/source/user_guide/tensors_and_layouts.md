@@ -436,10 +436,11 @@ layouts fail compilation; this is not an `out=` storage destination.
 
 `device_size` and `stride_map` are static integer lists. The compiled output
 uses the producer dtype and `ElementArrangement.STANDARD`; therefore non-standard
-element arrangements cannot be requested through this API. This compiler-only
-API raises when called eagerly. Use `tensor.to(device_layout=layout)` for eager
-conversion or layouts requiring other metadata. Compiled requests support FP16,
-BF16, and FP32.
+element arrangements cannot be requested through this API. Geometry must use a
+final stride of `1`, must not use broadcast (`0`) strides, and must have unique
+positive strides. This compiler-only API raises when called eagerly. Use
+`tensor.to(device_layout=layout)` for eager conversion or layouts requiring
+other metadata. Compiled requests support FP16, BF16, and FP32.
 
 ```python
 from torch_spyre import require_layout
