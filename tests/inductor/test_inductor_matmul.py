@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pytest
+import sympy
 import torch
 from torch._inductor.utils import run_and_get_code
 from torch.spyre import SpyreTensorLayout
 from utils_inductor import compare_with_cpu
 
 from torch_spyre import require_layout
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.propagate_layouts import _coordinate_upper_bound
 
 
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
@@ -100,6 +103,12 @@ class TestMatmulOps:
 
 
 class TestRequireLayout:
+    def test_rejects_multisymbol_coordinate_bound(self):
+        first, second = sympy.symbols("first second")
+
+        with pytest.raises(Unsupported, match="unsupported require_layout coordinate"):
+            _coordinate_upper_bound(first * second, {first: 2, second: 2})
+
     @pytest.mark.parametrize("dtype", [torch.bool, torch.float64, torch.int64])
     def test_rejects_unsupported_dtype(self, dtype):
         x = torch.ones(1, dtype=dtype)
@@ -221,6 +230,7 @@ class TestRequireLayout:
     @pytest.mark.parametrize(
         "fn",
         [
+            # Spyre has no sin lowering, so it becomes a FallbackKernel.
             lambda a: torch.sin(a),
             lambda a: a.sum(dim=-1),
         ],

@@ -31,7 +31,13 @@ _VIEW_OPS = {
 
 
 def _producer(source: torch.fx.Node) -> torch.fx.Node:
-    """Walk output-only views back to producer that must emit requested layout."""
+    """Walk supported output-only views back to physical producer.
+
+    Only views that preserve this feature's producer-layout contract are
+    supported. Materializing or axis-changing ops such as ``contiguous``,
+    ``permute``, ``transpose``, ``slice``, ``select``, ``squeeze``, and
+    ``unsqueeze`` remain attached to the request and fail as unsupported.
+    """
     while source.target in _VIEW_OPS:
         source = source.args[0]
         if not isinstance(source, torch.fx.Node):
@@ -40,7 +46,12 @@ def _producer(source: torch.fx.Node) -> torch.fx.Node:
 
 
 def _requests(graph: torch.fx.Graph) -> dict:
-    """Return request registry that survives FX graph replacement."""
+    """Return request registry that survives FX graph replacement.
+
+    Registry keys are request object IDs. ``collect_spyre_hints`` and
+    ``recover_spyre_hints`` preserve custom-metadata values by reference, so
+    those IDs remain valid until consumption is checked.
+    """
     if graph.owning_module is None:
         return graph.__dict__.setdefault(REQUESTS_KEY, {})
     return graph.owning_module.meta.setdefault(REQUESTS_KEY, {})

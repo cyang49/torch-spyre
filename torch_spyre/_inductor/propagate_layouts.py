@@ -1053,6 +1053,8 @@ def _coordinate_upper_bound(expr: sympy.Expr, ranges: dict) -> int:
         coefficient, term = expr.as_coeff_Mul()
         if coefficient < 0:
             raise Unsupported(f"negative require_layout coordinate {expr}")
+        if not term.is_Symbol:
+            raise Unsupported(f"unsupported require_layout coordinate {expr}")
         return int(coefficient) * _coordinate_upper_bound(term, ranges)
     if expr.func is sympy.Mod:
         base, modulus = expr.args
