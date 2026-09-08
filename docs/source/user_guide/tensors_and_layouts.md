@@ -437,10 +437,12 @@ destination.
 
 `device_size` and `stride_map` are static integer lists with equal, nonzero
 lengths. Device extents must be positive and their product must hold output
-values. Stride values must be at least `-1`; final stride must be `1`, broadcast
-(`0`) strides are forbidden, and positive strides must be unique. Compiled
-output uses producer dtype and `ElementArrangement.STANDARD`; non-standard
-element arrangements cannot be requested through this API. This compiler-only
+values. A stride of `-1` marks a synthetic or padded device dimension and does
+not map to a logical output stride. Other stride values must be positive; final
+stride must be `1`, broadcast (`0`) strides are forbidden, and positive strides
+must be unique. Compiled output uses producer dtype and
+`ElementArrangement.STANDARD`; non-standard element arrangements cannot be
+requested through this API. This compiler-only
 API raises when called eagerly. Use `tensor.to(device_layout=layout)` for eager
 conversion or layouts requiring other metadata. Compiled requests support FP16,
 BF16, and FP32.
