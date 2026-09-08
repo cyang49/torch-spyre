@@ -168,6 +168,23 @@ class TestRequireLayout:
 
         assert result.device_tensor_layout() == target
 
+    def test_expand_chain_emits_requested_pointwise_layout(self):
+        x = torch.randn(1, 128, dtype=torch.float16).to("spyre")
+        device_size = [2, 2, 64]
+        stride_map = [128, 64, 1]
+
+        result = torch.compile(
+            lambda a: require_layout((a + 1).expand(2, -1), device_size, stride_map)
+        )(x)
+
+        layout = result.device_tensor_layout()
+        assert layout is not None
+        assert list(layout.device_size) == device_size
+        assert list(layout.stride_map) == stride_map
+        torch.testing.assert_close(
+            result.cpu(), (x.cpu() + 1).expand(2, -1), atol=0.2, rtol=0.1
+        )
+
     def test_rejects_eager_execution(self):
         x = torch.randn(2, 128, dtype=torch.float16).to("spyre")
 

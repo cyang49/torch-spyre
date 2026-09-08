@@ -39,9 +39,16 @@ def _producer(source: torch.fx.Node) -> torch.fx.Node:
     return source
 
 
+def _requests(graph: torch.fx.Graph) -> dict:
+    """Return request registry that survives FX graph replacement."""
+    if graph.owning_module is None:
+        return graph.__dict__.setdefault(REQUESTS_KEY, {})
+    return graph.owning_module.meta.setdefault(REQUESTS_KEY, {})
+
+
 def apply_require_layout(graph: torch.fx.Graph) -> None:
     """Move static marker request onto producer and track its consumption."""
-    requests = graph.__dict__.setdefault(REQUESTS_KEY, {})
+    requests = _requests(graph)
     for node in list(graph.nodes):
         if node.target != torch.ops.spyre.require_layout.default:
             continue
@@ -72,7 +79,7 @@ def apply_require_layout(graph: torch.fx.Graph) -> None:
 
 def assert_require_layout_consumed(graph) -> None:
     """Reject hints not honored by a layout-aware producer in this graph."""
-    requests = graph.graph.__dict__.get(REQUESTS_KEY, {})
+    requests = _requests(graph.graph)
     pending = [request for request in requests.values() if not request["consumed"]]
     if pending:
         raise Unsupported("require_layout target has no supported compiled producer")
