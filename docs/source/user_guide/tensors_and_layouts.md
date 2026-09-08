@@ -444,8 +444,10 @@ must be unique. Compiled output uses producer dtype and
 `ElementArrangement.STANDARD`; non-standard element arrangements cannot be
 requested through this API. This compiler-only
 API raises when called eagerly. Use `tensor.to(device_layout=layout)` for eager
-conversion or layouts requiring other metadata. Compiled requests support FP16,
-BF16, and FP32.
+conversion or layouts requiring other metadata. Unlike `require_layout`, eager
+conversion happens after its producer has emitted its normal layout; it does not
+request direct producer emission. Compiled requests support FP16, BF16, and
+FP32.
 
 ```python
 from torch_spyre import require_layout
