@@ -222,9 +222,10 @@ class CustomPreGradPasses(_SpyreGraphPassPipeline):
 
 
 class CustomPrePasses(_SpyreGraphPassPipeline):
-    """
-    This inductor extension point enables Spyre-specific passes to run on the
-    post-grad FX graph early in the sequence defined in `post_grad.post_grad_passes`.
+    """Run early post-grad passes before AOT retracing can replace FX nodes.
+
+    ``apply_require_layout`` moves marker requests to producer metadata, then
+    ``collect_spyre_hints`` snapshots that metadata for recovery after retracing.
     """
 
     def __init__(self):
@@ -232,9 +233,11 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
-    """
-    This inductor extension point enables Spyre-specific passes to run on the
-    post-grad FX graph late in the sequence defined in `post_grad.post_grad_passes`.
+    """Run late post-grad passes after Spyre graph normalization.
+
+    Reapplying ``apply_require_layout`` is intentional and idempotent: it
+    attaches any marker surviving earlier rewrites before BMM normalization.
+    Markers removed by ``CustomPrePasses`` make this call a no-op.
     """
 
     def __init__(self):
