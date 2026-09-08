@@ -22,7 +22,7 @@ import math
 import sympy
 import torch
 from .logging_utils import get_inductor_logger
-from .layout_hints import REQUIRE_LAYOUT_KEY
+from .require_layout_pass import REQUIRE_LAYOUT_KEY
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,

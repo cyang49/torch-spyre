@@ -39,7 +39,7 @@ from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding, insert_restickify_padding
-from .layout_hints import apply_require_layout, assert_require_layout_consumed
+from .require_layout_pass import apply_require_layout, assert_require_layout_consumed
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
