@@ -15,6 +15,7 @@
 import io
 import math
 import warnings
+from itertools import product
 from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional, Sequence, TypeVar, Union
 
@@ -3455,6 +3456,45 @@ def _per_core_view_from_prep(
             )
         return core_to_slot
 
+    def flattened_outer_dim(sym: sympy.Symbol, split: int) -> int | None:
+        """Prove a static complete inner dimension under a flattened outer axis."""
+        extent_expr = iter_space[sym]
+        if isinstance(extent_expr, tuple):
+            extent_expr = extent_expr[0]
+        outer_extent = concretize_expr(extent_expr)
+        for axis, coordinate in enumerate(prep.dep_device_coordinates):
+            coordinate = sympy.expand(sympy.sympify(coordinate))
+            inner_extent = concretize_expr(coordinate.coeff(sym))
+            if (
+                inner_extent <= 1
+                or outer_extent % split
+                or device_size[axis] != outer_extent * inner_extent
+                or device_size[axis] % split
+            ):
+                continue
+            remainder = sympy.simplify(coordinate - inner_extent * sym)
+            remainder_syms = remainder.free_symbols
+            if sym in remainder_syms or any(
+                other not in iter_space or per_sym.get(other, 1) != 1
+                for other in remainder_syms
+            ):
+                continue
+            ranges = []
+            for other in remainder_syms:
+                other_extent = iter_space[other]
+                if isinstance(other_extent, tuple):
+                    other_extent = other_extent[0]
+                ranges.append(range(concretize_expr(other_extent)))
+            if math.prod(len(r) for r in ranges) > 1024:
+                continue
+            values = {
+                int(remainder.subs(dict(zip(remainder_syms, point))))
+                for point in product(*ranges)
+            }
+            if values == set(range(inner_extent)):
+                return axis
+        return None
+
     # Step 3: place each split on a device dim via stride lookup.
     #
     # stride_map[i] is a device-dim → host-stride mapping. The stickified
@@ -3561,6 +3601,9 @@ def _per_core_view_from_prep(
                     reason,
                 )
                 dev_dim = None
+
+        if dev_dim is None:
+            dev_dim = flattened_outer_dim(sym, split)
 
         # A reshape can place more than one logical loop symbol on one physical
         # device axis.  Splitting an inner symbol while an unsplit outer symbol

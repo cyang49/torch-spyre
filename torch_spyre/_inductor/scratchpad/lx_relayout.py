@@ -17,6 +17,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import math
+from itertools import product
 from collections.abc import Iterable, Mapping, Sequence
 from typing import cast
 
@@ -321,6 +322,54 @@ def work_division_from_view(
         raise ValueError("duplicate physical dimensions")
     rows = owner_slots(slots, physical_splits, n)
     axes_by_loop: dict[sympy.Symbol, list[int]] = {}
+    axis_coordinates: dict[int, sympy.Expr] = {}
+
+    def flattened_outer_loop(
+        axis: int, split: int
+    ) -> tuple[sympy.Symbol, sympy.Expr] | None:
+        """Prove ``outer * inner + remainder`` owns full inner groups."""
+        coordinate = sympy.expand(sympy.sympify(device_coordinates[axis]))
+        for loop in coordinate.free_symbols & iteration_space.keys():
+            coefficient = sympy.sympify(coordinate.coeff(loop))
+            if coefficient.is_Integer is not True or coefficient <= 1:
+                continue
+            coefficient = int(coefficient)
+            extent = iteration_space[loop]
+            extent = sympy.sympify(extent[0] if isinstance(extent, tuple) else extent)
+            if (
+                extent.is_Integer is not True
+                or extent <= 0
+                or int(extent) % split
+                or int(device_size[axis]) != int(extent) * coefficient
+            ):
+                continue
+            remainder = sympy.simplify(coordinate - coefficient * loop)
+            remainder_syms = remainder.free_symbols
+            if loop in remainder_syms:
+                continue
+            ranges = []
+            for other in remainder_syms:
+                if other not in iteration_space:
+                    break
+                other_extent = iteration_space[other]
+                other_extent = (
+                    other_extent[0] if isinstance(other_extent, tuple) else other_extent
+                )
+                other_extent = sympy.sympify(other_extent)
+                if other_extent.is_Integer is not True or other_extent <= 0:
+                    break
+                ranges.append(range(int(other_extent)))
+            else:
+                if math.prod(len(r) for r in ranges) > 1024:
+                    continue
+                values = {
+                    int(remainder.subs(dict(zip(remainder_syms, point))))
+                    for point in product(*ranges)
+                }
+                if values == set(range(coefficient)):
+                    return loop, sympy.Integer(coefficient) * loop
+        return None
+
     for axis, split in physical_splits.items():
         if (
             not 0 <= axis < len(device_size)
@@ -332,9 +381,14 @@ def work_division_from_view(
                 f"unsupported ownership input: axis {axis} not divisible by {split}"
             )
         symbols = device_coordinates[axis].free_symbols
-        if len(symbols) != 1 or not symbols <= iteration_space.keys():
-            raise ValueError(f"cannot map device dimension {axis} to one loop")
-        axes_by_loop.setdefault(next(iter(symbols)), []).append(axis)
+        if len(symbols) == 1 and symbols <= iteration_space.keys():
+            loop = next(iter(symbols))
+        else:
+            flattened = flattened_outer_loop(axis, split)
+            if flattened is None:
+                raise ValueError(f"cannot map device dimension {axis} to one loop")
+            loop, axis_coordinates[axis] = flattened
+        axes_by_loop.setdefault(loop, []).append(axis)
 
     any_fused = any(len(axes) > 1 for axes in axes_by_loop.values())
     splits, owners, expected = {}, {}, {}
@@ -387,7 +441,10 @@ def work_division_from_view(
             bounds = _loop_regions(
                 extent,
                 tuple(
-                    device_coordinates[a].xreplace({loop: _LOOP_POINT}) for a in axes
+                    axis_coordinates.get(a, device_coordinates[a]).xreplace(
+                        {loop: _LOOP_POINT}
+                    )
+                    for a in axes
                 ),
                 tuple(int(device_size[a]) for a in axes),
                 split,
