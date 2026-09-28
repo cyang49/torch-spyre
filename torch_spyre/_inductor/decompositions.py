@@ -70,12 +70,27 @@ _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
 # These constants do not represent a legacy non-HOP SDPA implementation.
 _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE = 2
-# When every selected tile count is one, ``map_tiles`` and the K/V scan
-# invoke their bodies directly. There is no HOP staging or carry handoff in
-# that graph: the score allocation can be reused after its reduction and only
-# the scaled query, weighted result, and normalized output overlap at peak.
+# With one K/V block, each outer map body computes the direct stable softmax:
+# the score allocation can be reused after its reduction, and only scaled
+# query, weighted result, and normalized output overlap at peak.
 _SDPA_DIRECT_LIVE_SCORE_BUFFER_ALLOWANCE = 1
 _SDPA_DIRECT_LIVE_QUERY_BUFFER_ALLOWANCE = 3
+# A B/H/G/Lq map around a single-block softmax still stages its input and
+# output at the map boundary, although it has no online-softmax carry.
+_SDPA_MAP_LIVE_QUERY_BUFFER_ALLOWANCE = 4
+# The direct SDPA graph has additional score-sized allocation constraints that
+# the summed live-byte estimate does not capture (layout/contiguous placement).
+# Reserve a fifth of LX when admitting prefill plans; at B=4, Lq=Lk=512,
+# D=64 the allocator keeps H=12 scores but spills a whole score at H=14.
+_SDPA_PREFILL_LX_USABLE_NUMERATOR = 4
+_SDPA_PREFILL_LX_USABLE_DENOMINATOR = 5
+# A score spill writes and rereads a full B*H*Lq*Lk buffer. On the device
+# one such card-wide transfer wave costs much more than one DSC dispatch;
+# keep the additional weight specific to score spills, not small HOP carries.
+_SDPA_SCORE_SPILL_WAVE_COST = 24
+# Each extra nested map adds a dispatch and staging boundary per inner tile;
+# a single four-trip query map is cheaper than a two-by-two B/Q nest.
+_SDPA_NESTED_MAP_DISPATCH_COST = 4
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
 _SDPA_MAX_TARGET_KV_BYTES_PER_CORE = 2 * 1024 * 1024
 _SDPA_GQA_HEADS_PER_KV_TARGET_MIB = 4
@@ -437,13 +452,11 @@ def _sdpa_estimated_live_bytes_per_core(
     """Estimate the co-live, non-streamed values for one SDPA iteration.
 
     V is streamed by the second matmul. K is restickified before the first
-    matmul and therefore participates in full-SDPA prefill residency. Full
-    nested prefill accounts for every score- and query-shaped value that can
-    overlap at a map/carry boundary. Any plan with no effective loop uses the
-    direct-body live set because ``map_tiles`` and the one-block scan bypass
-    ``for_each_tile``. Looped decode and SWA retain their separately calibrated
-    two-score/two-query estimate. These flags select a liveness accounting
-    regime; they do not select a different SDPA implementation.
+    matmul and participates in full-SDPA prefill residency. A single K/V block
+    uses the direct stable softmax even inside B/H/G/Lq map loops; only a
+    multi-block K/V scan needs online-softmax carry buffers. Looped decode
+    and SWA retain their separately calibrated two-score/two-query estimate.
+    These flags select a liveness accounting regime.
     """
     score_bytes = (
         batch_size * heads_per_core * query_rows_per_core * kv_block_size * element_size
@@ -671,13 +684,20 @@ def _sdpa_kv_candidates(
             element_size=element_size,
             restick_bytes_per_core=(restick_bytes_per_core if full_sdpa_prefill else 0),
             full_sdpa_prefill=full_sdpa_prefill,
-            has_loop_boundary=_sdpa_has_loop_boundary(
-                num_non_group_outer_tiles=num_non_group_outer_tiles,
-                num_group_tiles=num_group_tiles,
-                num_q_tiles=num_q_tiles,
-                num_kv_blocks=num_blocks,
+            has_loop_boundary=(
+                num_blocks > 1
+                if full_sdpa_prefill
+                else _sdpa_has_loop_boundary(
+                    num_non_group_outer_tiles=num_non_group_outer_tiles,
+                    num_group_tiles=num_group_tiles,
+                    num_q_tiles=num_q_tiles,
+                    num_kv_blocks=num_blocks,
+                )
             ),
         )
+        query_bytes = score_bytes * head_dim // effective_block_size
+        if full_sdpa_prefill and num_blocks == 1 and num_outer_tiles > 1:
+            live_bytes += _SDPA_MAP_LIVE_QUERY_BUFFER_ALLOWANCE * query_bytes
         blocks_per_group = _kv_blocks_per_loop_group(1, num_blocks)
         num_loop_groups = (num_blocks + blocks_per_group - 1) // blocks_per_group
         result.append(
@@ -685,17 +705,20 @@ def _sdpa_kv_candidates(
                 block_size=effective_block_size,
                 num_blocks=num_blocks,
                 score_bytes_per_core=score_bytes,
-                query_bytes_per_core=(score_bytes * head_dim // effective_block_size),
+                query_bytes_per_core=query_bytes,
                 estimated_live_bytes_per_core=live_bytes,
                 kv_bytes_per_core=kv_bytes_per_core,
                 estimated_restick_active_cores=restick_active_cores,
                 restick_bytes_per_core=restick_bytes_per_core,
                 restick_lx_eligible=restick_bytes_per_core <= restick_lx_limit,
-                # Eight fixed executes, about seventeen for every unrolled
-                # block, and one carry boundary per loop group in the DBO
-                # bundles inspected during calibration.
+                # Each single-block prefill map executes the direct stable
+                # softmax; only a K/V scan pays online carry operations.
                 estimated_dsc_executions=num_outer_tiles
-                * (8 + 17 * num_blocks + num_loop_groups),
+                * (
+                    10
+                    if full_sdpa_prefill and num_blocks == 1
+                    else 8 + 17 * num_blocks + num_loop_groups
+                ),
                 # One K and one V stream per online-softmax trip. Outer HOP
                 # tiles replay both streams; wider resident blocks reduce the
                 # number of independent load bursts without a token cutoff.
@@ -938,19 +961,30 @@ def _select_sdpa_tiling(
                                 * num_group_tiles
                                 // effective_group_tiles
                             )
-                            live_overflow = max(
-                                0,
-                                candidate.estimated_live_bytes_per_core
-                                - lx_budget_bytes,
+                            # The joint allocator must place score-shaped
+                            # buffers contiguously; a summed live-byte count
+                            # alone admits direct plans that spill a full score.
+                            usable_lx = (
+                                lx_budget_bytes
+                                * _SDPA_PREFILL_LX_USABLE_NUMERATOR
+                                // _SDPA_PREFILL_LX_USABLE_DENOMINATOR
+                                if candidate.num_blocks == 1
+                                else lx_budget_bytes
                             )
-                            # The analytical live count is conservative around
-                            # the map/carry handoff by one query-shaped slot.
-                            # Use that slot for admission, but charge the larger
-                            # score/query buffer that allocation may evict.
-                            spill_allowance = candidate.query_bytes_per_core
+                            live_overflow = max(
+                                0, candidate.estimated_live_bytes_per_core - usable_lx
+                            )
+                            # Online scans may evict a carry. A direct plan
+                            # evicts the larger of score and query/output;
+                            # wide K/V blocks generally make that a score.
                             spill_buffer_size = max(
                                 candidate.score_bytes_per_core,
                                 candidate.query_bytes_per_core,
+                            )
+                            spill_allowance = (
+                                spill_buffer_size
+                                if candidate.num_blocks == 1
+                                else candidate.query_bytes_per_core
                             )
                             estimated_spill_buffers = (
                                 (live_overflow + spill_allowance - 1) // spill_allowance
@@ -1021,10 +1055,55 @@ def _select_sdpa_tiling(
                                     ),
                                     estimated_spill_buffers=(estimated_spill_buffers),
                                     estimated_spill_bytes=estimated_spill_bytes,
+                                    # Serial B/H maps with too few independent
+                                    # rows strand lanes on every trip. Allow
+                                    # a small tail of idle cores (for example
+                                    # 28 of 32 at H=14) before charging it;
+                                    # query maps retain B/H parallelism.
                                     estimated_work=(
                                         candidate.estimated_dsc_executions
                                         + plan_load_bursts
                                         + plan_hbm_transfer_waves
+                                        + (
+                                            (_SDPA_SCORE_SPILL_WAVE_COST - 1)
+                                            * _sdpa_hbm_transfer_waves(
+                                                estimated_spill_bytes, num_cores
+                                            )
+                                            if candidate.num_blocks == 1
+                                            and estimated_spill_bytes
+                                            and candidate.score_bytes_per_core
+                                            >= candidate.query_bytes_per_core
+                                            else 0
+                                        )
+                                        + (
+                                            num_outer_tiles
+                                            * max(
+                                                0,
+                                                num_cores * 3 // 4
+                                                - batch_tile_size * head_tile_size,
+                                            )
+                                            if candidate.num_blocks == 1
+                                            and (
+                                                num_batch_tiles > 1
+                                                or num_head_tiles > 1
+                                            )
+                                            and group_extent == 1
+                                            else 0
+                                        )
+                                        + (
+                                            num_outer_tiles
+                                            * _SDPA_NESTED_MAP_DISPATCH_COST
+                                            * max(
+                                                0,
+                                                (num_batch_tiles > 1)
+                                                + (num_head_tiles > 1)
+                                                + (effective_group_tiles > 1)
+                                                + (num_q_tiles > 1)
+                                                - 1,
+                                            )
+                                            if candidate.num_blocks == 1
+                                            else 0
+                                        )
                                     ),
                                 )
                             )
@@ -1032,9 +1111,9 @@ def _select_sdpa_tiling(
         bounded_prefill = [
             plan
             for plan in plans
-            # Tolerate and price one query/output carry-sized uncertainty at
-            # the map boundary. Requiring more means DWSRS did not right-size
-            # the working set.
+            # Price at most one evicted intermediate per candidate. A direct
+            # single-block plan charges a score, while an online K/V scan
+            # allows one carry-sized placement uncertainty.
             if plan.estimated_spill_buffers <= 1
         ]
         for plan in plans:
@@ -1957,14 +2036,6 @@ def spyre__sdpa_overrideable(
     num_group_tiles = _sdpa_effective_group_tiles(
         tiling.num_group_tiles, tiling.num_q_tiles, num_kv_tiles
     )
-    direct_plan = not _sdpa_has_loop_boundary(
-        num_non_group_outer_tiles=(
-            tiling.num_batch_tiles * tiling.num_head_tiles * tiling.num_q_tiles
-        ),
-        num_group_tiles=tiling.num_group_tiles,
-        num_q_tiles=tiling.num_q_tiles,
-        num_kv_blocks=num_kv_tiles,
-    )
     logger.debug(
         "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
         "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
@@ -2030,11 +2101,11 @@ def spyre__sdpa_overrideable(
         # Q is invariant across the counted Lk loop.
         q_scaled = q_tile * query_scale
 
-        # A loop-free plan has no online-softmax state to carry. Keep
-        # its graph as the stable-softmax formula so the compiler sees the same
-        # short live ranges that the cost model charges above. Tiled plans retain
-        # the common carry path below.
-        if direct_plan:
+        # Outer map tiles do not require an online-softmax carry. Only a
+        # multi-block K/V scan needs the correction and accumulator path.
+        # In particular, query tiling can reduce score residency without
+        # paying for online-softmax state on every query tile.
+        if num_kv_tiles == 1:
             if use_gqa:
                 k_tile = k_tile.unsqueeze(2)
                 v_tile = v_tile.unsqueeze(2)

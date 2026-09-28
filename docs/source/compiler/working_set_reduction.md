@@ -266,6 +266,26 @@ a fixed-address LX scratchpad slot instead — see
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the `accum_full` /
 `accum_tile` buffers this distinction matters most for.
 
+### SDPA prefill and score residency
+
+The SDPA decomposition in `torch_spyre/_inductor/decompositions.py` searches
+exact batch, head, query-row, and K/V-block tiles. The score intermediate has
+shape `[B, H, Lq, Lk]`: increasing the number of heads can cross an LX
+placement threshold even when the per-core summed live-byte estimate still
+fits. A score placed in the off-chip intermediate pool is written and read
+again by softmax and the second matmul. The cost model therefore reserves
+space for allocation constraints and map-boundary staging and charges full
+score spills as off-chip round trips. The scratchpad allocator makes the
+final placement decision; the estimate is not a placement guarantee.
+
+Batch and head maps reduce the work exposed to each core per iteration;
+query-row maps keep the full batch/head axes visible but replay K/V reads.
+The planner prices those tradeoffs and the staging of nested maps rather
+than selecting a fixed head-count threshold. With a single K/V block, each
+outer tile computes the ordinary stable softmax; only multiple K/V blocks
+need online-softmax carry state. This lets query-row tiling reduce score
+residency without paying the extra online-softmax operations.
+
 ## Related documents
 
 - [`coarse_tiling_loops.md`](coarse_tiling_loops.md) — implementation
