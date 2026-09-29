@@ -1021,6 +1021,55 @@ def _select_sdpa_tiling(
                             plan_hbm_transfer_waves = _sdpa_hbm_transfer_waves(
                                 plan_hbm_bytes, num_cores
                             )
+                            score_spill_work = (
+                                (_SDPA_SCORE_SPILL_WAVE_COST - 1)
+                                * _sdpa_hbm_transfer_waves(
+                                    estimated_spill_bytes, num_cores
+                                )
+                                if candidate.num_blocks == 1
+                                and estimated_spill_bytes
+                                and candidate.score_bytes_per_core
+                                >= candidate.query_bytes_per_core
+                                else 0
+                            )
+                            # Serial B/H maps with too few independent rows
+                            # strand lanes on every trip. Allow a small tail
+                            # of idle cores (e.g. 28 of 32 at H=14) before
+                            # charging it; query maps retain B/H parallelism.
+                            underfilled_map_work = (
+                                num_outer_tiles
+                                * max(
+                                    0,
+                                    num_cores * 3 // 4
+                                    - batch_tile_size * head_tile_size,
+                                )
+                                if candidate.num_blocks == 1
+                                and (num_batch_tiles > 1 or num_head_tiles > 1)
+                                and group_extent == 1
+                                else 0
+                            )
+                            nested_map_work = (
+                                num_outer_tiles
+                                * _SDPA_NESTED_MAP_DISPATCH_COST
+                                * max(
+                                    0,
+                                    (num_batch_tiles > 1)
+                                    + (num_head_tiles > 1)
+                                    + (effective_group_tiles > 1)
+                                    + (num_q_tiles > 1)
+                                    - 1,
+                                )
+                                if candidate.num_blocks == 1
+                                else 0
+                            )
+                            estimated_work = (
+                                candidate.estimated_dsc_executions
+                                + plan_load_bursts
+                                + plan_hbm_transfer_waves
+                                + score_spill_work
+                                + underfilled_map_work
+                                + nested_map_work
+                            )
                             plans.append(
                                 _SDPAPrefillPlan(
                                     num_batch_tiles=num_batch_tiles,
@@ -1055,56 +1104,7 @@ def _select_sdpa_tiling(
                                     ),
                                     estimated_spill_buffers=(estimated_spill_buffers),
                                     estimated_spill_bytes=estimated_spill_bytes,
-                                    # Serial B/H maps with too few independent
-                                    # rows strand lanes on every trip. Allow
-                                    # a small tail of idle cores (for example
-                                    # 28 of 32 at H=14) before charging it;
-                                    # query maps retain B/H parallelism.
-                                    estimated_work=(
-                                        candidate.estimated_dsc_executions
-                                        + plan_load_bursts
-                                        + plan_hbm_transfer_waves
-                                        + (
-                                            (_SDPA_SCORE_SPILL_WAVE_COST - 1)
-                                            * _sdpa_hbm_transfer_waves(
-                                                estimated_spill_bytes, num_cores
-                                            )
-                                            if candidate.num_blocks == 1
-                                            and estimated_spill_bytes
-                                            and candidate.score_bytes_per_core
-                                            >= candidate.query_bytes_per_core
-                                            else 0
-                                        )
-                                        + (
-                                            num_outer_tiles
-                                            * max(
-                                                0,
-                                                num_cores * 3 // 4
-                                                - batch_tile_size * head_tile_size,
-                                            )
-                                            if candidate.num_blocks == 1
-                                            and (
-                                                num_batch_tiles > 1
-                                                or num_head_tiles > 1
-                                            )
-                                            and group_extent == 1
-                                            else 0
-                                        )
-                                        + (
-                                            num_outer_tiles
-                                            * _SDPA_NESTED_MAP_DISPATCH_COST
-                                            * max(
-                                                0,
-                                                (num_batch_tiles > 1)
-                                                + (num_head_tiles > 1)
-                                                + (effective_group_tiles > 1)
-                                                + (num_q_tiles > 1)
-                                                - 1,
-                                            )
-                                            if candidate.num_blocks == 1
-                                            else 0
-                                        )
-                                    ),
+                                    estimated_work=estimated_work,
                                 )
                             )
 
