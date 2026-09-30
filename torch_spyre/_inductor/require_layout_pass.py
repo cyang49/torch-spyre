@@ -20,6 +20,7 @@ from .errors import Unsupported
 
 REQUIRE_LAYOUT_KEY = "require_layout"
 REQUESTS_KEY = "_spyre_require_layout_requests"
+REQUIRE_LAYOUT_PIN_ATTR = "_spyre_require_layout_pin"
 
 
 _VIEW_OPS = {

@@ -140,6 +140,31 @@ class TestRequireLayout:
         assert self_layout == target
         assert "device_size=[1, 8, 128, 64]" in source_codes[0]
 
+    def test_gathered_bmm_input_keeps_requested_layout(self):
+        batch, q_len, head_dim = 32, 128, 128
+        query_table = torch.randn(128, q_len, head_dim, dtype=torch.float16).to("spyre")
+        query_index = torch.arange(batch, dtype=torch.int32).to("spyre")
+        key = torch.randn(batch, head_dim, 128, dtype=torch.float16).to("spyre")
+        target = SpyreTensorLayout(
+            [batch, q_len, head_dim],
+            [q_len * head_dim, head_dim, 1],
+            torch.float16,
+            [0, 1, 2],
+        )
+        device_size = list(target.device_size)
+        stride_map = list(target.stride_map)
+
+        def fn(table, index, k):
+            query = torch.index_select(table, 0, index)
+            query = require_layout(query, device_size, stride_map)
+            return query, torch.bmm(query, k)
+
+        (query, _), _ = run_and_get_code(
+            torch.compile(fn), query_table, query_index, key
+        )
+
+        assert query.device_tensor_layout() == target
+
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
     def test_pointwise_emits_requested_output_layout(self, dtype):
         x = torch.randn(2, 128, dtype=dtype)

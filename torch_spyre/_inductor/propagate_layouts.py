@@ -22,7 +22,7 @@ import math
 import sympy
 import torch
 from .logging_utils import get_inductor_logger
-from .require_layout_pass import REQUIRE_LAYOUT_KEY
+from .require_layout_pass import REQUIRE_LAYOUT_KEY, REQUIRE_LAYOUT_PIN_ATTR
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,
@@ -1332,6 +1332,7 @@ def _required_layout_stl(
         raise Unsupported(
             f"{op.get_name()}: require_layout coordinates exceed geometry"
         )
+    setattr(op, REQUIRE_LAYOUT_PIN_ATTR, stl)
     for request in requests:
         request["consumed"] = True
     return stl

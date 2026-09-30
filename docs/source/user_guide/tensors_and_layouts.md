@@ -423,6 +423,9 @@ matmul producers and eligible pointwise producers, including output-only
 illegal direct layouts fail compilation; this is not an `out=` storage
 destination.
 
+This request also pins the producer against the automatic non-stick dimension
+reordering used for matmul work division.
+
 `device_size` and `stride_map` are static integer lists with equal, nonzero
 lengths. Device extents must be positive and their product must hold output
 values. A stride of `-1` marks a synthetic or padded device dimension and does
