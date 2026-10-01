@@ -119,11 +119,16 @@ class SchedNodeArg(NamedTuple):
 
 @dataclass(frozen=True)
 class AlignmentAccess:
-    """One tensor access before its coordinates are normalized for codegen."""
+    """One tensor access before its coordinates are normalized for codegen.
+
+    ``is_index_tensor`` marks an entry vector whose row count may split inside
+    its physical stick.
+    """
 
     device_layout: Any
     index: sympy.Expr
     name: str | None = None
+    is_index_tensor: bool = False
 
 
 def input_layout_for_operation(op: Operation, name: str, default: Any) -> Any:
@@ -1561,6 +1566,7 @@ def build_operation_alignment_inputs(
                 repeat_info_out=repeat_snapshot,
             ),
             "name": access.name,
+            "is_index_tensor": access.is_index_tensor,
         }
         for access in accesses
     ]

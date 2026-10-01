@@ -322,6 +322,7 @@ def _scatter_alignment_inputs(
     if not isinstance(output_layout, FixedTiledLayout):
         return None
     _, indirect_sizes = _scatter_access_subs_and_sizes(op, output_layout, write_dep)
+    index_names, _, _ = indirect_info_from_op(op)
 
     accesses: list[AlignmentAccess] = []
     for dep in read_writes.reads:
@@ -333,7 +334,10 @@ def _scatter_alignment_inputs(
             return None
         accesses.append(
             AlignmentAccess(
-                overrides.get(dep.name, layout.device_layout), dep.index, dep.name
+                overrides.get(dep.name, layout.device_layout),
+                dep.index,
+                dep.name,
+                dep.name in index_names,
             )
         )
     accesses.append(

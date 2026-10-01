@@ -1062,9 +1062,11 @@ class TestGather(_GatherScenarios, IndirectAccessTestCase):
 
 
 class _GatherMulticoreScenarios:
-    """Gather scenarios run once at 32 cores. The work-division split-map tests
-    verify classification and end-to-end correctness; the cross-core test checks
-    shared-table correctness under a real multi-core split."""
+    """Gather scenarios run once at 32 cores and assert emitted split behavior.
+
+    The work-division regression checks the final SDSC mapping, not just the
+    frontend planner decision.
+    """
 
     to_spyre = staticmethod(plain_to_spyre)
 
@@ -1122,9 +1124,7 @@ class _GatherMulticoreScenarios:
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     def test_work_division_index_split_capped(self):
-        """Index with element count Q=256: splits via core_split(256, SENCORES),
-        capped by divisor count. Verify K stays unsplit and op is correct.
-        """
+        """A 256-entry index uses all 32 cores after SDSC alignment."""
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1132,7 +1132,26 @@ class _GatherMulticoreScenarios:
             return x, i
 
         fn = self._gather_fn
-        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+        args = make()
+        result = self.check(fn, *args, expect=GATHER_OP_SPEC)
+        gather_sdscs = []
+        for top in result.sdsc_jsons.values():
+            for outer in top.values():
+                has_index_input = any(
+                    opfunc == IDENTITY_OP
+                    and any(
+                        node.get("indirectAllocType_") == "index_tensor"
+                        for node in body.get("scheduleTree_", [])
+                    )
+                    for dsc in outer.get("dscs_", [])
+                    for opfunc, body in dsc.items()
+                )
+                if has_index_input:
+                    gather_sdscs.append(outer)
+        self.assertEqual(len(gather_sdscs), 1)
+        self.assertEqual(gather_sdscs[0]["numWkSlicesPerDim_"].get("mb"), 32)
+        self.assertEqual(gather_sdscs[0]["numCoresUsed_"], 32)
+        run_e2e(self, fn, *args)
 
     def test_work_division_unaligned_data_dim(self):
         """An unaligned value-table data dim (K=48, not divisible by any core

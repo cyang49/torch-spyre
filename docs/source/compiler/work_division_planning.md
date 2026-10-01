@@ -123,6 +123,13 @@ element counts to stick counts so core splits always align to stick
 boundaries. When tensors of different dtypes share a stick variable,
 the conversion uses the largest `elems_per_stick` across those tensors.
 
+Indirect index-entry dimensions are an exception to whole-stick splitting. An
+index vector is a runtime row count, and each core can read its assigned entries
+independently, including a partial physical index stick. This exception applies
+only to the index-entry tensor; shared gather tables and scatter destinations
+still obey their data-dimension split constraints, and ordinary payload tensors
+remain stick-aligned.
+
 ### Per-core memory span (256 MB)
 
 Each Spyre core has a 256 MB limit on the memory span it can address.
@@ -135,11 +142,12 @@ of positions along that dimension that each core covers.
 If splits are not applied, a large tensor can violate this limit. Pass 1
 detects violations and computes the minimum number of slices on the
 responsible iteration variables that bring the span back within range.
-For stick variables, valid slice counts are restricted to divisors of
-the stick count, so each core always receives a whole number of sticks.
-If the same iteration variable is a stick variable for one tensor and a
-span variable for another and no slice count satisfies both
-simultaneously, the compiler raises an error at compile time.
+For data-stick variables, valid slice counts are restricted to divisors of
+the stick count, so each core always receives a whole number of sticks. The
+index-entry exception above uses the entry count instead. If the same data
+iteration variable is a stick variable for one payload tensor and a span
+variable for another and no slice count satisfies both constraints, the
+compiler raises an error at compile time.
 
 ### Hardware constants
 

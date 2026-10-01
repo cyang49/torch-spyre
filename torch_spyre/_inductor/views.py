@@ -779,7 +779,7 @@ class AlignmentInputs:
     """Everything tensor alignment needs, captured without hidden graph state."""
 
     iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]]
-    tensors: list[dict[str, list[sympy.Expr]]]
+    tensors: list[dict[str, Any]]
     indirect_sizes: dict[sympy.Symbol, int] | None
     repeat_info: dict[sympy.Symbol, dict]
     concrete_ranges: dict[sympy.Symbol, int | float]
@@ -837,6 +837,7 @@ def build_alignment_inputs(
             {
                 "size": list(tensor["size"]),
                 "coordinates": list(tensor["coordinates"]),
+                "is_index_tensor": bool(tensor.get("is_index_tensor", False)),
             }
             for tensor in tensors
         ],
@@ -917,6 +918,14 @@ def align_tensors_pure(
         stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
 
+    index_tensor_indices = {
+        i for i, tensor in enumerate(tensors) if tensor.get("is_index_tensor", False)
+    }
+    data_stick_sizes: dict[sympy.Symbol, int] = {}
+    for i, var in enumerate(stick_dim):
+        if var is not None and i not in index_tensor_indices:
+            data_stick_sizes.setdefault(var, int(stick_size[i]))
+
     _synthetic_var_idx = len(new_vars)  # do not reuse synthetic vars after this point
 
     # for each variable collect bounds (den and mod) for all terms involving variable
@@ -959,19 +968,21 @@ def align_tensors_pure(
     # sort splits
     splits = {var: sorted(val) for var, val in splits.items()}
 
-    # When a tensor has the canonical pair of an outer-stick coordinate and an
-    # innermost stick coordinate for the same variable, every interior boundary
-    # must fall between physical sticks.  A boundary inside a stick cannot be
-    # represented as a device dimension: the outer-stick adjustment below would
-    # truncate it to zero (for example 16 // 32), or to an incorrect nonzero
-    # extent (for example 48 // 32).  Do not apply this restriction merely
-    # because the innermost coordinate uses the variable: arbitrary coordinate
-    # expressions in preceding dimensions can legally split it at other points.
-    # The final boundary is the logical range endpoint, so a partial last stick
-    # (for example 7 int32 elements in a 32-element stick) remains valid.
+    # For ordinary data tensors, a canonical outer-stick/inner-stick pair means
+    # every interior alignment boundary must fall between physical sticks. A
+    # boundary inside a stick cannot be represented as a device dimension: the
+    # outer-stick adjustment below would truncate it to zero (e.g. 16 // 32), or
+    # to an incorrect extent (e.g. 48 // 32). Index-entry tensors are exempt:
+    # each core can independently address its assigned index entries. Do not
+    # apply the data-stick restriction merely because the innermost coordinate
+    # uses the variable; arbitrary preceding-dimension coordinates may split it
+    # elsewhere. The final boundary is the logical endpoint, so a partial last
+    # stick (e.g. 7 int32 entries in a 32-entry stick) remains valid.
     for tensor_index, (terms, var, physical_stick_size) in enumerate(
         zip(all_terms, stick_dim, stick_size)
     ):
+        if tensor_index in index_tensor_indices:
+            continue
         if var is None:
             # A constant/broadcast innermost coordinate has no stick loop to split.
             continue
@@ -1011,12 +1022,13 @@ def align_tensors_pure(
             for v in reversed(remap[var]):
                 # Re-intersect the committed split against the basis work
                 # division used for this var.
-                if v == var and v in stick_dim:
-                    # Stick var: stick count. The element range would drop a
-                    # legal split when the size is not a multiple of it
-                    # (e.g. gcd(2, 67) == 1).
-                    eps = int(stick_size[stick_dim.index(v)])
-                    basis = (int(new_var_ranges[v]) + eps - 1) // eps  # stick count
+                if v == var and v in data_stick_sizes:
+                    # Data stick var: split in whole physical sticks. An index
+                    # entry var is work-divided by entry count, even inside its
+                    # index tensor's physical stick.
+                    basis = (
+                        int(new_var_ranges[v]) + data_stick_sizes[v] - 1
+                    ) // data_stick_sizes[v]
                 else:
                     # Non-stick var (or synthetic sub-dim): element range.
                     basis = new_var_ranges[v]
@@ -1168,7 +1180,7 @@ def align_tensors_pure(
 
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
-    tensors: list[Dict[str, list[sympy.Expr]]],
+    tensors: list[Dict[str, Any]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     repeat_info: "dict[sympy.Symbol, dict] | None" = None,
 ) -> tuple[

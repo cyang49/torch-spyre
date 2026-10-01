@@ -67,6 +67,7 @@ from .pass_utils import (
     concretize_expr,
     device_coordinates,
     indirect_forbidden_split_syms,
+    indirect_info_from_op,
     is_restickify_coords,
     op_read_writes,
 )
@@ -316,8 +317,15 @@ def aligned_ownership_split_domains(
     matmul row-order mismatch, using these same aligned segments.
     """
     tensor_deps = [*ctx.input_tds, ctx.output_td]
+    index_names, _, _ = indirect_info_from_op(ctx.op)
     accesses = [
-        AlignmentAccess(td.layout.device_layout, td.dep.index) for td in tensor_deps
+        AlignmentAccess(
+            td.layout.device_layout,
+            td.dep.index,
+            td.dep.name,
+            td.dep.name in index_names,
+        )
+        for td in tensor_deps
     ]
     try:
         alignment_inputs = build_operation_alignment_inputs(
@@ -1099,12 +1107,12 @@ def keep_by_index_search_adjacent_blocked_vars(
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Keep indirect shared-data and unsafe partial-stick dims unsplit.
+    """Keep shared indirect data dims unsplit; leave index entries element-splittable.
 
-    A gather value table and scatter destination have one shared base on every
-    core. Their data dims must therefore stay at split=1. A partial index stick
-    also stays unsplit unless gather-output padding made its entry slices
-    stick-aligned. Other index-entry dims remain available for multicore work.
+    Gather value tables and scatter destinations have a shared base on every
+    core, so their data dims stay at split=1. The index-entry dim is a runtime
+    row count, not payload data: each core can independently read its assigned
+    entries, including a partial physical index stick.
     """
     return ConstraintResult(
         allowed_splits={

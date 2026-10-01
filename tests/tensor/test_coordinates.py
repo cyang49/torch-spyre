@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from types import SimpleNamespace
 
 import sympy
-
 import torch
-from torch.testing._internal.common_utils import run_tests, TestCase
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import FixedLayout
 from torch._inductor.virtualized import V
+from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
@@ -45,14 +46,13 @@ from torch_spyre._inductor.propagate_layouts import (
     find_stick_compatible_input_layout,
 )
 from torch_spyre._inductor.views import (
+    UnalignedStickSplit,
     _decompose_constant_offset,
     align_tensors,
     compute_coordinates,
     normalize_coordinates,
     tiling_expr_to_device_expr,
-    UnalignedStickSplit,
 )
-from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
 
@@ -360,6 +360,74 @@ class TestCoordinates(TestCase):
         )
 
         self.assertTrue(all(size > 0 for tensor in aligned for size in tensor["size"]))
+
+    def test_align_tensors_preserves_index_entry_split(self):
+        entry, width = sympy.symbols("entry width", integer=True, nonnegative=True)
+        iteration_space = {entry: (256, 32), width: (64, 1)}
+        index_tensor = {
+            "size": [8, 32],
+            "coordinates": [sympy.floor(entry / 32), sympy.Mod(entry, 32)],
+        }
+        output_tensor = {
+            "size": [256, 64],
+            "coordinates": [entry, sympy.Mod(width, 64)],
+        }
+
+        stick_split, _, _ = align_tensors(
+            iteration_space, [index_tensor, output_tensor]
+        )
+        index_tensor["is_index_tensor"] = True
+        entry_split, _, _ = align_tensors(
+            iteration_space, [index_tensor, output_tensor]
+        )
+
+        self.assertEqual(stick_split[entry][1], 8)
+        self.assertEqual(entry_split[entry][1], 32)
+
+    def test_align_tensors_allows_substick_index_entry_boundary(self):
+        entry, head, width = sympy.symbols(
+            "entry head width", integer=True, nonnegative=True
+        )
+        indirect = sympy.Symbol("indirect", integer=True, nonnegative=True)
+        tensors = [
+            {
+                "size": [2, 32],
+                "coordinates": [
+                    sympy.floor(entry / 32),
+                    sympy.Mod(entry, 32),
+                ],
+                "is_index_tensor": True,
+            },
+            {
+                "size": [128, 8, 4, 1, 64],
+                "coordinates": [
+                    head + 8 * sympy.Mod(entry, 16),
+                    sympy.floor(entry / 16),
+                    sympy.floor(width / 64),
+                    sympy.S.Zero,
+                    sympy.Mod(width, 64),
+                ],
+            },
+            {
+                "size": [128, 8, 4, 1, 64],
+                "coordinates": [
+                    indirect,
+                    head,
+                    sympy.floor(width / 64),
+                    sympy.S.Zero,
+                    sympy.Mod(width, 64),
+                ],
+            },
+        ]
+
+        aligned, _, work_division_remap = align_tensors(
+            {entry: (64, 2), head: (8, 1), width: (256, 1)},
+            tensors,
+            {indirect: 128},
+        )
+
+        entry_splits = [aligned[dim][1] for dim, _ in work_division_remap[entry]]
+        self.assertEqual(math.prod(entry_splits), 2)
 
     def test_compute_coordinates_rejects_overlapping_moduli(self):
         """Multiple Mods remain unsupported unless they form one digit chain."""

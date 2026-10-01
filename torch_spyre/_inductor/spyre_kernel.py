@@ -1864,10 +1864,19 @@ def simplify_op_spec(
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
 
+    index_tensor_names = {
+        str(index_access.args[0])
+        for index_access in (indirect_access_subs or {}).values()
+        if isinstance(index_access, IndirectAccess)
+    }
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,
         [
-            {"size": arg.device_size, "coordinates": arg.device_coordinates}
+            {
+                "size": arg.device_size,
+                "coordinates": arg.device_coordinates,
+                "is_index_tensor": arg.name in index_tensor_names,
+            }
             for arg in op_spec.args
         ],
         indirect_sizes,
