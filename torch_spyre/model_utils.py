@@ -308,6 +308,7 @@ def dma_moe_expert_weight_to_spyre(
     contraction rows adjacent within each free-dimension stick block. The
     PyTorch shape remains ``[E, C, F]`` in both modes. Returns ``None`` when
     ``F`` does not span complete sticks for the target dtype.
+    An unsupported ``layout`` value raises ``ValueError``.
     """
     assert weight.ndim == 3, "MoE expert-weight path is for rank-3 [E,C,F] only"
     if layout not in ("gather", "contract_contiguous"):
@@ -330,8 +331,13 @@ def dma_moe_expert_weight_to_spyre(
         return None
 
     if layout == "contract_contiguous":
+        # [E, F // eps, C, eps]: keep experts separate, with contraction
+        # rows adjacent within each free-dimension stick block.
         device_layout = SpyreTensorLayout(
-            list(weight.shape), list(weight.stride()), dev_dtype, [1, 0, 2]
+            [experts, free // eps, contract, eps],
+            [contract * free, eps, free, 1],
+            get_device_dtype(dev_dtype),
+            {(0,): experts, (1, 3): free, (2,): contract},
         )
     else:
         device_layout = SpyreTensorLayout(
