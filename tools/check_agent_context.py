@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Validate the coding-agent context structure of this repository.
 
 Layer-1 checks from the AGENTS.md standardization (PR #5500): the context
@@ -10,32 +23,21 @@ files other agents rely on must exist and be well-formed. Checks:
 4. Every ``SKILL.md`` under ``.claude/skills/`` (root and nested subtrees)
    has YAML frontmatter with non-empty ``name`` and single-line
    ``description`` (what the Agent Skills spec keys discovery on).
+5. Every skill's ``name`` is advertised in ``AGENTS.md`` so agents without
+   subtree discovery find it.
 
 Run from anywhere; paths are resolved against the repository root found
 via ``git rev-parse``. Exits non-zero on the first failing category,
 listing every offending file.
-
-Copyright IBM Corp. 2026
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
 """
 
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 from pathlib import Path
 
+import regex as re
 import yaml
 
 
@@ -77,14 +79,26 @@ def check_skills_symlink(root: Path) -> list[str]:
     return errors
 
 
+def tracked_skill_files(root: Path) -> list[Path]:
+    """Tracked ``SKILL.md`` files under any ``.claude/skills/`` tree.
+
+    Tracked, not filesystem-globbed: a developer's untracked local skill
+    must not fail the pre-commit hook. CI (``--all-files``) sees the same
+    set because it checks a fresh checkout.
+    """
+    out = subprocess.run(
+        ["git", "ls-files", "*/SKILL.md", "SKILL.md"], capture_output=True, text=True
+    )
+    return [
+        root / line
+        for line in out.stdout.splitlines()
+        if ".claude/skills/" in line and line != "SKILL.md"
+    ]
+
+
 def check_skill_frontmatter(root: Path) -> list[str]:
     errors: list[str] = []
-    # ``**`` matches zero or more directories, so this covers the root
-    # ``.claude/skills/`` and nested ones (``torch_spyre/_inductor/.claude/skills/``).
-    skill_files = sorted(
-        {p for p in root.glob("**/.claude/skills/**/SKILL.md") if ".git" not in p.parts}
-    )
-    for path in skill_files:
+    for path in tracked_skill_files(root):
         rel = path.relative_to(root)
         text = path.read_text()
         match = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
@@ -112,12 +126,39 @@ def check_skill_frontmatter(root: Path) -> list[str]:
     return errors
 
 
+def check_skills_advertised(root: Path) -> list[str]:
+    errors: list[str] = []
+    agents_path = root / "AGENTS.md"
+    agents_text = agents_path.read_text() if agents_path.is_file() else ""
+    for path in tracked_skill_files(root):
+        rel = path.relative_to(root)
+        text = path.read_text()
+        match = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+        if not match:
+            continue  # already reported by check_skill_frontmatter
+        try:
+            meta = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            continue  # already reported by check_skill_frontmatter
+        if not isinstance(meta, dict):
+            continue
+        name = meta.get("name")
+        if name and name not in agents_text:
+            errors.append(
+                f"{rel}: skill 'name' ({name}) is not mentioned anywhere in "
+                "AGENTS.md; agents without subtree skill discovery cannot "
+                "find it"
+            )
+    return errors
+
+
 def main() -> int:
     root = repo_root()
     failures = [
         *check_context_files(root),
         *check_skills_symlink(root),
         *check_skill_frontmatter(root),
+        *check_skills_advertised(root),
     ]
     if failures:
         print("agent context validation FAILED:")

@@ -96,8 +96,8 @@ repos:
         name: Validate agent context structure
         entry: python tools/check_agent_context.py
         language: python
-        additional_dependencies: [PyYAML]
-        files: ^(AGENTS\.md|CLAUDE\.md|\.pre-commit-config\.yaml|\.claude/skills/.*|\.agents/.*)$
+        additional_dependencies: [PyYAML, regex]
+        files: (^|/)(AGENTS\.md|CLAUDE\.md|\.pre-commit-config\.yaml)|(^|/)\.claude/skills/.*|(^|/)\.agents/.*
         pass_filenames: false
       # Keep `suggestion` last
       - id: suggestion
