@@ -14,7 +14,7 @@ repos:
     rev: v0.9.31
     hooks:
       - id: pymarkdown
-        exclude: .*\.inc\.md|\.claude/skills/.*
+        exclude: .*\.inc\.md|\.claude/skills/.*|\.agents/skills/.*
         args: [fix]
   # v1.7.7 enforced the OLD workflow_dispatch cap of 10 inputs; GitHub raised it to 25 in
   # Dec 2025. v1.7.12 knows the current limit, and additionally rejects `type:` on composite
