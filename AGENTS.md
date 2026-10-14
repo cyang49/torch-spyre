@@ -173,7 +173,6 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **check-docs** — documentation consistency and staleness audit
 - **daily-status** — automated standup updates from git activity
 - **upgrade-pytorch-version** — PyTorch dependency upgrade workflow
-- **write-rfc** — design proposal workflow (RFCs now at https://github.com/torch-spyre/rfcs)
 
 Subtree-specific skills live in `torch_spyre/_inductor/.claude/skills/`
 (`inductor-overview`, `logging`); load them when working under that path.
