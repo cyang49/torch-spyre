@@ -91,6 +91,7 @@ repos:
         language: python
         types: [python]
         pass_filenames: false
+        additional_dependencies: [regex]
       - id: check-agent-context
         name: Validate agent context structure
         entry: python tools/check_agent_context.py
