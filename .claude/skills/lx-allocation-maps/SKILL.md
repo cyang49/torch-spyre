@@ -69,6 +69,45 @@ configuration changes; preserve it under the experiment directory if graph
 matching is needed. Spyre supports one device process at a time: run jobs
 serially.
 
+For vLLM, launch from its checkout using that checkout's environment and wrap
+the actual benchmark command. Example one-request capture:
+
+```bash
+cd /path/to/spyre-inference
+SKILL=/path/to/torch-spyre/.claude/skills/lx-allocation-maps
+RUN="$PWD/agentic-experiments/<new-timestamp>-allocation-map"
+mkdir -p "$RUN"
+export TORCHINDUCTOR_CACHE_DIR="$RUN/torchinductor-cache"
+env SPYRE_NUM_CPUS=8 \
+  uv run --no-sync python "$SKILL/capture.py" \
+    --output-dir "$RUN/capture" -- \
+    uv run --no-sync vllm bench latency \
+      --model google/gemma-4-26B-A4B-it \
+      --input-len 1024 --output-len 64 --batch-size 1 \
+      --max-model-len 1088 --num-iters-warmup 1 --num-iters 1
+```
+
+Adjust model and shapes to the user's workload. This one-warmup/one-measurement
+example is for capture smoke only, not a stable latency benchmark. Record the
+requested and resolved concurrency/token-budget settings from vLLM logs.
+
+
+
+### Startup warnings, model support and run issues
+Preserve and classify the full `capture/command.log`; do not suppress warnings or
+assume a warning means capture failed. vLLM can warn that a model/shape is not
+in the Spyre model registry while proceeding; report it as unvalidated even if
+the run succeeds. Scheduler warnings can describe a requested
+`max_num_batched_tokens` later overridden by the Spyre platform; record both
+requested and resolved values. Triton/CPU-Triton fallback and Hugging Face Hub
+authentication/rate-limit warnings are distinct from CP-SAT capture status;
+record them and state whether they affected completion. Successful execution is
+not an independent numerical correctness check.
+
+Keep an issue log with the step/command, observed message or failure, diagnosis,
+resolution/workaround, and proposed skill improvement. Record compiler warnings
+(including work-division/provenance warnings) rather than treating captured
+allocations as correctness evidence.
 For repeatable measurements, pin the compile cache and solver settings explicitly
 before launching the CLI; for example:
 
@@ -140,9 +179,8 @@ python "$SKILL/plot.py" "$RUN/capture/allocations.<pid>.jsonl" \
   --output-dir "$RUN/plots" --record 7
 ```
 
-Plotting requires Matplotlib. The CLIs require no project modifications. If it
-is not installed in the active environment, install it into the experiment
-folder only, then use that target for the plotting command:
+Plotting requires Matplotlib. If unavailable, install it to the absolute
+experiment-local directory and use that same absolute path for `PYTHONPATH`:
 
 ```bash
 uv pip install --target "$RUN/plot-deps" matplotlib
