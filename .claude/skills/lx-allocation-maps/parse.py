@@ -72,8 +72,9 @@ def _validate_record(record: dict) -> list[str]:
         problems.append(
             "global_watermark_bytes does not match resident address extents"
         )
-    if record.get("timeline_matches_global_watermark") is not True:
-        problems.append("timeline_matches_global_watermark is false")
+    time_unit = record.get("allocation_time_unit", "operation")
+    if time_unit not in ("operation", "half_operation"):
+        problems.append(f"invalid allocation time unit {time_unit!r}")
     if record.get("all_resident_spans_within_capacity") is not True:
         problems.append("all_resident_spans_within_capacity is false")
     for buffer in resident:
@@ -89,10 +90,15 @@ def _validate_record(record: dict) -> list[str]:
         if tick.get("op_index") != index:
             problems.append("timeline indices are not contiguous from zero")
             break
+        allocation_tick = tick.get("allocation_tick", index)
+        expected_tick = 2 * index + 1 if time_unit == "half_operation" else index
+        if allocation_tick != expected_tick:
+            problems.append(f"operation {index} allocation tick mismatch")
+            break
         active = [
             buffer
             for buffer in resident
-            if buffer["start_time"] <= index < buffer["end_time"]
+            if buffer["start_time"] <= allocation_tick < buffer["end_time"]
         ]
         tick_watermark = max(
             (
@@ -107,10 +113,18 @@ def _validate_record(record: dict) -> list[str]:
         if tick.get("active_resident_buffers") != [buffer["name"] for buffer in active]:
             problems.append(f"operation {index} active resident list mismatch")
             break
-    if (
-        max((tick.get("watermark_bytes", 0) for tick in timeline), default=0)
-        != watermark
+    operation_watermark = max(
+        (tick.get("watermark_bytes", 0) for tick in timeline), default=0
+    )
+    if record.get("max_operation_watermark_bytes") != operation_watermark:
+        problems.append("maximum operation watermark does not match timeline")
+    if operation_watermark > watermark:
+        problems.append("operation watermark exceeds global watermark")
+    if record.get("timeline_matches_global_watermark") is not (
+        operation_watermark == watermark
     ):
+        problems.append("timeline_matches_global_watermark is inconsistent")
+    if time_unit == "operation" and operation_watermark != watermark:
         problems.append(
             "per-operation watermark timeline does not match global watermark"
         )
@@ -139,6 +153,7 @@ def _summary(record: dict, index: int) -> dict:
         "inductor_post_grad_graph_id": record.get("inductor_post_grad_graph_id"),
         "allocator": record.get("allocator"),
         "solver": record.get("solver"),
+        "allocation_time_unit": record.get("allocation_time_unit", "operation"),
         "operation_count": len(operations),
         "operations_with_fx_origins": fx_ops,
         "operations_with_source_file": source_ops,
@@ -146,6 +161,7 @@ def _summary(record: dict, index: int) -> dict:
         "resident_count": len(resident),
         "spilled_count": len(buffers) - len(resident),
         "global_watermark_bytes": watermark,
+        "max_operation_watermark_bytes": record.get("max_operation_watermark_bytes"),
         "capacity_bytes": capacity,
         "watermark_fraction": watermark / capacity if capacity else None,
         "timeline_matches_global_watermark": record.get(

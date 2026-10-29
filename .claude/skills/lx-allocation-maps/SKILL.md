@@ -15,14 +15,34 @@ agent-authored.
 ## Important semantics
 
 - A capture record is one allocator solve / compiled graph, **not** one runtime
-  invocation. A model can invoke a graph many times or contain nested compiled
-  regions. Capture a runtime trace separately if mapping graph IDs to call counts
-  or compile regions matters.
+  invocation. This skill covers static allocation capture and is not the place to
+  collect runtime invocation counts or profiler traces. Do not infer call counts
+  from allocation records.
 - Plotted lifetimes and addresses are the frontend planner's static solve. They
   do not show emitted bundle instruction order, runtime occupancy, HBM traffic,
   or a model-wide peak across graphs.
-- The plotted watermark is the highest resident buffer end address at each
-  operation index, not the sum of resident buffer sizes.
+- The plotted watermark is the highest resident buffer end address at an
+  allocator tick, not the sum of resident buffer sizes. In ordinary solves,
+  allocator tick `i` is graph operation index `i`; the fixed-division relayout
+  planner can instead place operation `i` at `2*i+1` with a transfer at `2*i`.
+  Read `allocation_time_unit` and `timeline[].allocation_tick` rather than
+  interpreting every tick as an operation. `uses` has at most one entry per
+  graph op that accesses the buffer; for a computed buffer its first access is
+  the producing write. The lifetime-start marker may therefore coincide with
+  a write, not a read. A plot dot is one recorded access tick, not each load
+  instruction or repeated read within an operation.
+  Keep half-open intervals `[start_time, end_time)` and do not impose a
+  universal two-operation minimum.
+- Capture distinguishes host tensor shape, dtype, and strides from physical
+  `SpyreTensorLayout` where available: `device_size`, `stride_map`,
+  `device_dtype`, `element_arrangement`, and `valid_elements`. Unknown/symbolic
+  values remain explicit; a synthetic relayout destination does not inherit
+  its source's physical layout. `logical_size_bytes` is a legacy field holding
+  the solver's total buffer footprint, **not** `numel * dtype.itemsize`; use
+  `logical_tensor_bytes` for host logical bytes when available. The captured
+  `reserved_size_bytes` is the selected division's candidate per-core LX
+  footprint; it represents actual LX reservation only when an LX address was
+  assigned.
 - `capacity_bytes` is the frontend allocator's available range for that compile
   configuration, not necessarily the physical 2 MiB LX size.
 - These scripts instrument `CoOptimizingAllocator._post_solve`. They capture
@@ -132,10 +152,12 @@ processes/configurations cannot be mistaken for one capture set.
 `capture.py` writes:
 
 - `capture/allocations.<pid>.jsonl`: one complete JSON object per allocator
-  solve, with graph identity, solver, buffers, operation origins, operation
-  timeline, address watermark, capacity, and invariant flags;
+  solve, with graph identity, solver, per-buffer host and Spyre layout metadata
+  where available, producer/consumer graph-op indices, operation origins,
+  allocator-tick timeline, address watermark, capacity, and invariant flags;
 - `capture/processes.<pid>.jsonl`: confirms which Python processes loaded the
-  hook;
+  hook; a `capture_failed` entry with traceback flags an omitted graph record
+  without interrupting compilation;
 - `capture/run.json`: command, working directory, Python executable and key
   compile/allocation environment values;
 - `capture/command.log`: target stdout and stderr.
@@ -152,8 +174,9 @@ python "$SKILL/parse.py" "$RUN/capture/allocations.<pid>.jsonl" \
 ```
 
 The command validates JSON/schema, solver identity, graph operation counts,
-resident-buffer spans, global watermark, and per-operation watermark. A valid
-run exits zero and writes:
+resident-buffer spans, global watermark, and per-operation watermarks at their
+allocator ticks. A transfer-only tick can set a global peak above the maximum
+sampled at graph operations. A valid run exits zero and writes:
 
 - `parsed/summary.json`: one row per captured graph with operation/source
   coverage, resident/spilled counts, watermark, capacity and fraction;
@@ -188,25 +211,96 @@ PYTHONPATH="$RUN/plot-deps" python "$SKILL/plot.py" \
   "$RUN/capture/allocations.<pid>.jsonl" --output-dir "$RUN/plots"
 ```
 
-Each rendered graph produces PNG, HTML operation ledger, TSV operation ledger,
-and JSON graph summary. `plots/manifest.json` indexes all outputs. The plotter
-rechecks CP-SAT solver identity and recorded watermark/capacity invariants
-before rendering. PNG color indicates peak-setting versus other resident
-buffers; the red line is the per-operation address watermark; dashed line is
-planner capacity. The HTML ledger includes active resident buffers, operation
-watermark, FX source files/code, and operation names where available.
+Each rendered graph produces an interactive offline HTML allocation map, PNG,
+HTML operation ledger, TSV operation ledger, and JSON graph summary.
+`plots/manifest.json` indexes all outputs. The plotter rechecks CP-SAT solver
+identity and recorded watermark/capacity invariants before rendering. Blue
+rectangles are ordinary LX-resident buffers; orange marks ordinary buffers
+reaching the highest LX address, while teal identifies synthetic relayout
+buffers (with an orange outline if at the highest address). The red line is
+the highest live LX address at each tick; the dashed line is planner capacity.
+Both plots display numeric allocator ticks on aligned x-axes. The operation
+strip uses a separate repeating palette keyed to operation type. The operation
+ledger includes active resident buffers, operation watermark, FX source files,
+code, and operation names where available.
+
+#### Inspecting tensor metadata and the interactive map
+
+The JSONL buffer entries preserve the legacy `logical_size_bytes` field as the
+solver buffer size, and include `allocated_size_bytes` with the same meaning.
+`logical_tensor_bytes` is the host shape × dtype itemsize when concretely
+available; `reserved_size_bytes` is the per-core LX footprint of the selected
+division. Do not equate these three numbers. Host shape/dtype/strides and
+structured Spyre layout (`device_size`, `stride_map`, `device_dtype`,
+`element_arrangement`, `valid_elements`) may be unavailable. These are
+**planner pre-commit** layouts, not guaranteed to be the final emitted bundle
+layout. An explicit unknown is not proof of any particular layout. Synthetic
+relayout copies carry source metadata separately and do not claim their source
+layout as the destination layout.
+
+Open the interactive HTML map locally: operation/tick position is the x-axis,
+LX address is the y-axis. `Fit full graph` fits the complete timeline into the
+map viewport. The slider and `+`/`−` buttons preserve the viewport center; with
+the pointer over the plot, **W/S** zoom in/out around the pointer's horizontal
+position and **A/D** pan left/right. Both plots are displayed at full height
+and scroll horizontally only; there is no vertical scrollbar.
+The separate nonresident **graph-buffer** plot shares the same allocator-tick
+x-axis and zoom: each small dot marks one recorded reference/use tick, a larger
+outlined dot marks the lifetime start, and the thin line spans the half-open
+lifetime. The y-axis is log₂ solver footprint bytes. A hollow point in the
+bottom gutter means the solver footprint is unknown or nonpositive; it does
+not imply a zero-sized tensor or establish HBM allocation. Select a use dot or
+the outlined lifetime-start point to inspect its buffer. Click/focus the plot
+pane to enable keyboard controls. Modified browser shortcuts and typing in
+controls are not intercepted.
+Buffers with a known empty `consumer_op_indices` list are omitted from the
+nonresident plot and table because the graph records no consuming op for them.
+The omitted count is shown; entries remain in raw capture. Unknown (`null`) consumer
+metadata is retained rather than treated as an empty list.
+`RelayoutCopyBuffer` candidates: a copy without an LX address means its
+LX-to-LX shuffle was **not selected**, not that a shuffle spilled to HBM.
+These rejected candidates remain in the raw JSONL for solver analysis but
+are excluded from the nonresident plot, table and operation-linked lists;
+the viewer reports their omitted count separately. This is distinct from the
+known-empty-consumer filter above. Selected LX relayout copies are shown by
+default in the LX map, with a checkbox to hide them; they are solver planning
+entries, not additional graph operations.
+
+The `-1` solver-size sentinel means the allocator could not compute an LX
+placement footprint (for example, a mutation alias or a buffer without a fixed
+Spyre device layout); it is not a measurement of the buffer's logical or
+physical size. `logical_tensor_bytes` may still be known, and a captured
+`device_size` may be present for some entries. A nonresident planner record
+means only that this solve did not assign an LX address. Downstream codegen
+later assigns ordinary HBM arguments or an `hbm_pool` offset to eligible tensor
+arguments, but these pre-commit records do not capture that final allocation
+key/address. Therefore neither a positive size nor an unsized record alone
+proves a real HBM allocation; inspect final bundle `allocation` metadata for
+HBM/HBM-pool placement. Neither establishes measured runtime HBM traffic.
+The searchable/filterable companion table is sorted lexicographically by its
+operation-links text (then by buffer name) and has a bounded-height region
+with independent vertical scrolling and sticky column headers. It retains
+overlapping points and source context. The right-side selection panel can be
+collapsed; selecting a buffer or operation opens it again. Generated HTML has
+pre-rendered charts, log-size y-labels, numeric x-axes and table rows even
+when local JavaScript is disabled; hover/focus tooltips, zoom and filtering
+require JavaScript. Use the operation ledger for FX source context and JSONL
+for downstream analysis. Both plots show static frontend planning only:
+nonresident points do not prove measured HBM traffic.
+Older captures without added metadata remain inspectable with unknown
+fields shown as unavailable.
+
 
 ### 4. Agent-authored Markdown report — agent-dependent
 
 Do not add a Markdown-report generator to the standalone CLIs. When the user
-asks for a written report, the agent should inspect `parsed/summary.json`, the
-raw capture JSONL, `capture/run.json`, relevant compile logs, and runtime trace
-if available. Write `report.md` manually, recording:
+asks for a written report, inspect `parsed/summary.json`, the raw capture JSONL,
+`capture/run.json`, and relevant compile logs. Write `report.md` manually,
+recording:
 
 - workload, shapes/dtypes, compile controls, device/runtime, repository
-  revisions, commands, and run counts;
-- captured graph inventory and operation/source coverage; graph-call counts
-  only when supported by separately collected runtime evidence;
+  revisions, commands, and number of capture runs;
+- captured graph inventory and operation/source coverage;
 - highest watermarks and capacities, with links to the specific PNG/ledger/TSV;
 - CP-SAT and invariant validation status;
 - interpretation limits: static planner address extents, no inference of runtime

@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import json
 import linecache
+import math
 import os
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import regex
@@ -45,7 +47,7 @@ from torch._functorch._aot_autograd.logging_utils import (
     get_aot_graph_name,
 )
 
-from torch_spyre._inductor.pass_utils import op_short_name
+from torch_spyre._inductor.pass_utils import op_read_writes, op_short_name
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 
 _FRAME_RE = regex.compile(r'File "([^"]+)", line (\d+)')
@@ -120,7 +122,149 @@ def _origins(graph, operation) -> list[dict]:
     return [_node_record(unique[name]) for name in sorted(unique)]
 
 
-def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
+def _optional_value(obj, attribute):
+    try:
+        return getattr(obj, attribute, None)
+    except Exception:
+        # Capture must not turn a missing/deferred compiler layout into a failure.
+        return None
+
+
+def _dimensions(values):
+    if values is None:
+        return None
+    try:
+        result = []
+        for value in values:
+            if isinstance(value, int) or (
+                getattr(value, "is_number", False)
+                and getattr(value, "is_integer", False)
+            ):
+                result.append(int(value))
+            else:
+                result.append(str(value))
+        return result
+    except Exception:
+        return None
+
+
+def _spyre_layout(layout):
+    if layout is None:
+        return dict.fromkeys(
+            (
+                "device_size",
+                "stride_map",
+                "device_dtype",
+                "element_arrangement",
+                "valid_elements",
+            )
+        )
+    valid = _optional_value(layout, "valid_elements")
+    try:
+        valid_elements = (
+            [
+                {"device_dims": list(dims), "count": int(count)}
+                for dims, count in sorted(valid.items())
+            ]
+            if valid is not None
+            else None
+        )
+    except Exception:
+        valid_elements = None
+    dtype = _optional_value(layout, "device_dtype")
+    arrangement = _optional_value(layout, "element_arrangement")
+    return {
+        "device_size": _dimensions(_optional_value(layout, "device_size")),
+        "stride_map": _dimensions(_optional_value(layout, "stride_map")),
+        "device_dtype": _optional_value(dtype, "name"),
+        "element_arrangement": _optional_value(arrangement, "name"),
+        "valid_elements": valid_elements,
+    }
+
+
+def _lx_view(view):
+    if view is None:
+        return None
+    try:
+        return {
+            "work_slice_dims": [list(pair) for pair in view.work_slice_dims],
+            "core_to_slot": [
+                {"device_dim": dim, "slot": str(slot)}
+                for dim, slot in view.core_to_slot
+            ],
+            "num_cores": view.num_cores,
+        }
+    except Exception:
+        return None
+
+
+def _tensor_metadata(graph, name):
+    try:
+        tensor = graph.try_get_buffer(name)
+        layout = tensor.get_layout() if tensor is not None else None
+    except Exception:
+        layout = None
+    shape = _dimensions(_optional_value(layout, "size"))
+    strides = _dimensions(_optional_value(layout, "stride"))
+    dtype = _optional_value(layout, "dtype")
+    dtype_name = str(dtype) if dtype is not None else None
+    device_layout = _optional_value(layout, "device_layout")
+    physical = _spyre_layout(device_layout)
+    if (
+        shape is None
+        and strides is None
+        and dtype_name is None
+        and device_layout is None
+    ):
+        status = "unavailable"
+    elif (
+        shape is not None
+        and strides is not None
+        and dtype_name is not None
+        and all(value is not None for value in physical.values())
+    ):
+        status = "complete"
+    else:
+        status = "partial"
+    try:
+        logical_bytes = (
+            math.prod(shape) * dtype.itemsize
+            if shape is not None
+            and all(type(dim) is int and dim >= 0 for dim in shape)
+            and dtype is not None
+            else None
+        )
+    except Exception:
+        logical_bytes = None
+    return {
+        "host_shape": shape,
+        "host_strides": strides,
+        "host_dtype": dtype_name,
+        "spyre_tensor_layout": physical,
+        "logical_tensor_bytes": logical_bytes,
+        "metadata_status": status,
+    }
+
+
+def _graph_edges(graph):
+    producers = {}
+    consumers = {}
+    readable = True
+    for index, op in enumerate(graph.operations):
+        name = _optional_value(op, "name")
+        if name is not None:
+            producers[name] = index
+        try:
+            for dep in op_read_writes(op).reads:
+                if dep.name is not None:
+                    consumers.setdefault(dep.name, set()).add(index)
+        except Exception:
+            # A partial read graph cannot prove a buffer has no consumers.
+            readable = False
+    return producers, consumers, readable
+
+
+def _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts):
     try:
         aot_path, model_name, nth_graph = get_aot_compilation_context()
         aot_graph_name = get_aot_graph_name()
@@ -147,6 +291,19 @@ def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
                 "origins": _origins(graph, operation),
             }
         )
+    producers, consumers, readable = _graph_edges(graph)
+    graph_input_names = set(graph.graph_input_names)
+    plans_by_destination = {
+        plan.destination_name: plan for plan in accepted_lx_relayouts
+    }
+    # Fixed-division allocation inserts synthetic destinations and transforms
+    # graph operation i to tick 2*i+1, leaving transfer ticks at 2*i. Joint
+    # solver relayout-copy buffers keep untransformed op indices.
+    half_ticks = any(
+        buffer.name.startswith("__spyre_lx_relayout__:")
+        and not buffer.name.startswith("__spyre_lx_relayout__:copy:")
+        for buffer in allocation
+    )
 
     buffers = []
     resident = []
@@ -155,9 +312,78 @@ def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
         reserved_size = (
             buffer.per_core_size(division) if division is not None else buffer.size
         )
+        synthetic = buffer.name.startswith("__spyre_lx_relayout__")
+        candidates = getattr(buffer, "candidates", ())
+        source_name = getattr(buffer, "relayout_parent", None)
+        plan = plans_by_destination.get(buffer.name)
+        if source_name is None and synthetic and not candidates:
+            # Fixed-division destination names carry their source, even when
+            # the plan was rejected after solving.
+            parts = buffer.name.split(":", 2)
+            source_name = parts[1] if len(parts) == 3 else None
+        if plan is None and source_name and candidates:
+            plan = next(
+                (
+                    accepted
+                    for accepted in accepted_lx_relayouts
+                    if accepted.source_name == source_name
+                    and accepted.destination_view == candidates[0].destination_view
+                    and accepted.destination_address == buffer.address
+                ),
+                None,
+            )
+        if plan is not None:
+            source_name = plan.source_name
+        source_metadata = _tensor_metadata(graph, source_name) if source_name else None
+        if synthetic:
+            # The source layout is NOT the physical layout of the LX copy.
+            metadata = {
+                "host_shape": None,
+                "host_strides": None,
+                "host_dtype": None,
+                "spyre_tensor_layout": _spyre_layout(None),
+                "logical_tensor_bytes": None,
+                "metadata_status": "synthetic_relayout_destination_unknown",
+            }
+            consumer_indices = (
+                sorted({producers[name] for name in plan.consumer_names})
+                if plan is not None
+                and all(name in producers for name in plan.consumer_names)
+                else sorted({tick // 2 for tick in buffer.uses if tick % 2})
+                if half_ticks and not candidates
+                else None
+            )
+            producer_index = None  # Shuffle is at a transfer tick, not a graph op.
+            lx_view = (
+                plan.destination_view
+                if plan is not None
+                else getattr(buffer, "lx_view", None)
+            )
+        else:
+            metadata = _tensor_metadata(graph, buffer.name)
+            producer_index = (
+                None if buffer.name in graph_input_names else producers.get(buffer.name)
+            )
+            # Graph readers remain graph readers even when the planner
+            # substitutes an LX relayout copy at separate transfer ticks.
+            consumer_indices = (
+                sorted(consumers.get(buffer.name, ())) if readable else None
+            )
+            lx_view = getattr(buffer, "lx_view", None)
+            if lx_view is None:
+                lx_view = next(
+                    (
+                        item.source_view
+                        for item in accepted_lx_relayouts
+                        if item.source_name == buffer.name
+                    ),
+                    None,
+                )
         record = {
             "name": buffer.name,
+            # Legacy v2 name: this is solver allocation footprint, NOT logical bytes.
             "logical_size_bytes": buffer.size,
+            "allocated_size_bytes": buffer.size,
             "reserved_size_bytes": reserved_size,
             "start_time": buffer.start_time,
             "end_time": buffer.end_time,
@@ -169,7 +395,25 @@ def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
             ),
             "spill_reason": buffer.spill_reason,
             "residency_reason": buffer.residency_reason,
-            "is_synthetic_relayout": buffer.name.startswith("__spyre_lx_relayout__"),
+            "is_synthetic_relayout": synthetic,
+            **metadata,
+            "producer_op_index": producer_index,
+            "consumer_op_indices": consumer_indices,
+            "source_name": source_name,
+            "source_metadata": source_metadata,
+            "source": (
+                next(
+                    (
+                        origin["source"]
+                        for origin in operations[producer_index]["origins"]
+                        if origin["source"] is not None
+                    ),
+                    None,
+                )
+                if producer_index is not None
+                else None
+            ),
+            "lx_view": _lx_view(lx_view),
         }
         buffers.append(record)
         if buffer.address is not None:
@@ -177,7 +421,7 @@ def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
 
     timeline = []
     for operation in operations:
-        index = operation["op_index"]
+        index = 2 * operation["op_index"] + 1 if half_ticks else operation["op_index"]
         active = [
             buffer
             for buffer in resident
@@ -193,6 +437,7 @@ def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
         timeline.append(
             {
                 **operation,
+                "allocation_tick": index,
                 "watermark_bytes": watermark,
                 "capacity_bytes": allocator.size,
                 "active_resident_buffers": [buffer["name"] for buffer in active],
@@ -216,6 +461,8 @@ def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
     )
     record = {
         "schema": "spyre-lx-allocation-graph-trace-v2",
+        "metadata_capture_phase": "planner_pre_commit",
+        "allocation_time_unit": "half_operation" if half_ticks else "operation",
         "pid": os.getpid(),
         "timestamp_unix": time.time(),
         "aot_graph_name": aot_graph_name,
@@ -256,6 +503,25 @@ def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
     with _LOCK, path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, default=str) + "\n")
         stream.flush()
+    return None
+
+
+def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
+    try:
+        _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts)
+    except Exception:
+        # Inspection is best effort, but an omitted record must be visible.
+        with _LOCK, _STATUS_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "event": "capture_failed",
+                        "pid": os.getpid(),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                + "\n"
+            )
     return _ORIGINAL_POST_SOLVE(allocator, graph, allocation, accepted_lx_relayouts)
 
 
