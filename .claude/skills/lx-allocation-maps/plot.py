@@ -108,7 +108,7 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
     )
     loop_stripe = (
         '<line x1="75" x2="95" y1="536" y2="536" '
-        'stroke="#ff00a8" stroke-width="4"/>'
+        'stroke="#a64d77" stroke-width="4"/>'
         '<text x="101" y="540" class="axis-label">while_loop_ buffer</text>'
     )
     resident_shapes = []
@@ -230,7 +230,7 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
         '<line x1="75" y1="22" x2="75" y2="259" class="axis"/>'
         '<line x1="75" y1="259" x2="1175" y2="259" class="axis"/>'
         '<text x="68" y="263" text-anchor="end" class="axis-label">unsized</text>'
-        '<line x1="75" x2="95" y1="286" y2="286" stroke="#ff00a8" stroke-width="4"/>'
+        '<line x1="75" x2="95" y1="286" y2="286" stroke="#a64d77" stroke-width="4"/>'
         '<text x="101" y="290" class="axis-label">while_loop_ buffer</text>'
         + y_labels
         + "".join(points)
@@ -298,10 +298,10 @@ svg .buffer{fill:#397db8;fill-opacity:.48;stroke:#24577f;stroke-width:1;cursor:p
 svg .buffer.peak{fill:#e58a32;stroke:#9c4c17}
 svg .buffer.relayout{fill:#168c9a;stroke:#075c66;fill-opacity:.72}
 svg .buffer.relayout.peak{stroke:#9c4c17;stroke-width:2.5}
-svg .buffer.while-loop{fill:#ff00a8;stroke:#7a004f;fill-opacity:.9}
+svg .buffer.while-loop{fill:#a64d77;stroke:#63314d;fill-opacity:.9}
 svg .buffer.while-loop.peak{stroke:#9c4c17;stroke-width:2.5}
-svg .nonresident-interval.while-loop{stroke:#ff00a8;stroke-opacity:.95;stroke-width:3}
-svg .nonresident-point.while-loop{fill:#ff00a8;stroke:#7a004f}
+svg .nonresident-interval.while-loop{stroke:#a64d77;stroke-opacity:.95;stroke-width:3}
+svg .nonresident-point.while-loop{fill:#a64d77;stroke:#63314d}
 svg .nonresident-interval{stroke:#8162a6;stroke-width:2;stroke-opacity:.55;pointer-events:none}
 svg .nonresident-interval.relayout{stroke:#168c9a}
 svg .nonresident-use{fill:#172739;stroke:white;stroke-width:.8;cursor:pointer}
@@ -309,9 +309,9 @@ svg .nonresident-use.relayout{fill:#075c66}
 svg .nonresident-use:hover,svg .nonresident-use:focus,svg .nonresident-use.selected,svg .nonresident-use.related{stroke:#e58a32;stroke-width:2.5}
 svg .nonresident-marker{font:16px system-ui,sans-serif;font-weight:700;text-anchor:middle;dominant-baseline:middle;cursor:pointer;fill:#14548e;pointer-events:all}
 svg .nonresident-marker.consumer{fill:#a33b20}
-svg .nonresident-use.while-loop{fill:#7a004f;stroke:#ff00a8}
-svg .nonresident-marker.while-loop{fill:#ff00a8}
-svg .while-loop-stripe{stroke:#ff00a8;stroke-width:4;pointer-events:none}
+svg .nonresident-use.while-loop{fill:#63314d;stroke:#a64d77}
+svg .nonresident-marker.while-loop{fill:#a64d77}
+svg .while-loop-stripe{stroke:#a64d77;stroke-width:4;pointer-events:none}
 svg .buffer:hover,svg .buffer:focus,svg .buffer.selected,svg .buffer.related{fill-opacity:.85;stroke:#121f32;stroke-width:2}
 svg .watermark{fill:none;stroke:#c72d32;stroke-width:2;pointer-events:none}
 svg .capacity{stroke:#666;stroke-dasharray:6 4;pointer-events:none}
@@ -326,8 +326,8 @@ svg .capacity{stroke:#666;stroke-dasharray:6 4;pointer-events:none}
 .swatch.nonresident{background:#8162a6;border-color:#46305f;opacity:1}
 .swatch.unsized{background:white;border:2px dashed #46305f;opacity:1}
 .swatch.use{width:.45rem;height:.45rem;border-radius:50%;background:#172739;border-color:white;box-shadow:0 0 0 1px #172739;opacity:1}
-.swatch.while-loop{background:#ff00a8;border-color:#7a004f;opacity:1}
-svg .op-tick.while-loop{fill:#ff00a8!important;stroke:#3b0026;stroke-width:1.5}
+.swatch.while-loop{background:#a64d77;border-color:#63314d;opacity:1}
+svg .op-tick.while-loop{fill:#a64d77!important;stroke:#63314d;stroke-width:1.5}
 svg .op-tick.while-loop.op-tick.associated,svg .op-tick.while-loop.op-tick.selected{stroke:#fff;stroke-width:3}
 svg .op-tick{stroke:#fff;stroke-width:.6;cursor:pointer}
 svg .op-index{font:10px system-ui,sans-serif;fill:#fff;pointer-events:none}
@@ -668,7 +668,7 @@ function drawMap() {
     const item = document.createElement("span"), swatch = document.createElement("i");
     const isWhileLoop = type === "while_loop";
     swatch.className = `swatch${isWhileLoop ? " while-loop" : ""}`;
-    swatch.style.background = isWhileLoop ? "#ff00a8" : palette[i % palette.length];
+    swatch.style.background = isWhileLoop ? "#a64d77" : palette[i % palette.length];
     swatch.setAttribute("aria-hidden", "true");
     item.append(swatch, document.createTextNode(type));
     opLegend.append(item);
@@ -678,7 +678,7 @@ function drawMap() {
     const opType = String(op.op_type || "unknown");
     const isWhileLoop = opType === "while_loop";
     const rect = svg("rect", {x:px,y:railY,width:Math.max(1,plotWidth/maxTick),height:24,
-      fill:isWhileLoop ? "#ff00a8" : palette[types.indexOf(opType) % palette.length],
+      fill:isWhileLoop ? "#a64d77" : palette[types.indexOf(opType) % palette.length],
       class:`op-tick${isWhileLoop ? " while-loop" : ""}`,role:"button",tabindex:0,
       "aria-label":`Operation ${i}: ${format(op.operation_name || op.op_type)}`});
     const title = svg("title", {});
@@ -1036,12 +1036,12 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 (start, address),
                 end - start,
                 extent,
-                facecolor="#ff00a8"
+                facecolor="#a64d77"
                 if buffer["name"].startswith("while_loop_")
                 else PALETTE[6]
                 if buffer.get("is_synthetic_relayout")
                 else (PALETTE[1] if is_peak else PALETTE[0]),
-                edgecolor="#3b0026"
+                edgecolor="#63314d"
                 if buffer["name"].startswith("while_loop_")
                 else "#9c4c17"
                 if is_peak
@@ -1062,7 +1062,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 Line2D(
                     [start, end],
                     [address + extent / 2, address + extent / 2],
-                    color="#ff00a8",
+                    color="#a64d77",
                     linewidth=4,
                     zorder=3,
                 )
@@ -1125,7 +1125,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 alpha=0.72,
                 label="Buffer reaching the highest LX address",
             ),
-            Line2D([], [], color="#ff00a8", linewidth=4, label="while_loop_ buffer"),
+            Line2D([], [], color="#a64d77", linewidth=4, label="while_loop_ buffer"),
             Line2D([], [], color="#666", linestyle="--", label="Planner LX capacity"),
         ],
         loc="upper left",
@@ -1145,7 +1145,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
         dict.fromkeys(str(op.get("op_type") or "unknown") for op in operations)
     )
     type_colors = {
-        name: "#ff00a8" if name == "while_loop" else PALETTE[position % len(PALETTE)]
+        name: "#a64d77" if name == "while_loop" else PALETTE[position % len(PALETTE)]
         for position, name in enumerate(op_types)
     }
     nonresident_buffers = [
@@ -1193,7 +1193,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
         nonresident_ax.plot(
             [start, end],
             [y, y],
-            color="#ff00a8" if loop_buffer else "#8162a6",
+            color="#a64d77" if loop_buffer else "#8162a6",
             linewidth=2.5 if loop_buffer else 1.6,
             alpha=0.85,
         )
@@ -1201,7 +1201,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
             [start],
             [y],
             facecolors="none",
-            edgecolors="#ff00a8" if loop_buffer else "#46305f",
+            edgecolors="#a64d77" if loop_buffer else "#46305f",
             s=32,
             linewidths=1.2,
             zorder=4,
@@ -1215,7 +1215,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 xytext=(0, 6),
                 textcoords="offset points",
                 ha="center",
-                color="#ff00a8" if loop_buffer else "#14548e",
+                color="#a64d77" if loop_buffer else "#14548e",
                 fontsize=9,
             )
         for consumer in buffer.get("consumer_op_indices") or []:
@@ -1238,7 +1238,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 ha="center",
                 va="center",
                 fontsize=6,
-                color="#7a004f",
+                color="#63314d",
                 clip_on=True,
             )
     nonresident_ax.set(
@@ -1259,7 +1259,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 linewidth=1.6,
                 label="Nonresident buffer lifetime",
             ),
-            Line2D([], [], color="#ff00a8", linewidth=2.5, label="while_loop_ buffer"),
+            Line2D([], [], color="#a64d77", linewidth=2.5, label="while_loop_ buffer"),
             Line2D(
                 [],
                 [],
