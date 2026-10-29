@@ -230,13 +230,13 @@ The JSONL buffer entries preserve the legacy `logical_size_bytes` field as the
 solver buffer size, and include `allocated_size_bytes` with the same meaning.
 `logical_tensor_bytes` is the host shape × dtype itemsize when concretely
 available; `reserved_size_bytes` is the per-core LX footprint of the selected
-division. Do not equate these three numbers. Host shape/dtype/strides and
-structured Spyre layout (`device_size`, `stride_map`, `device_dtype`,
-`element_arrangement`, `valid_elements`) may be unavailable. These are
-**planner pre-commit** layouts, not guaranteed to be the final emitted bundle
-layout. An explicit unknown is not proof of any particular layout. Synthetic
-relayout copies carry source metadata separately and do not claim their source
-layout as the destination layout.
+division. Do not equate these three numbers. The details view shows one
+**Reason** when spill and residency reasons match; distinct values are labeled
+**Solver outcome** and **LX eligibility**. Host shape/dtype/strides and
+structured Spyre layout may be unavailable. These are **planner pre-commit**
+layouts, not guaranteed to be the final emitted bundle layout. An explicit
+unknown is not proof of any particular layout. Synthetic relayout copies carry
+source metadata separately and do not claim their source as destination layout.
 
 Open the interactive HTML map locally: operation/tick position is the x-axis,
 LX address is the y-axis. `Fit full graph` fits the complete timeline into the
@@ -245,14 +245,15 @@ the pointer over the plot, **W/S** zoom in/out around the pointer's horizontal
 position and **A/D** pan left/right. Both plots are displayed at full height
 and scroll horizontally only; there is no vertical scrollbar.
 The separate nonresident **graph-buffer** plot shares the same allocator-tick
-x-axis and zoom: each small dot marks one recorded reference/use tick, a larger
-outlined dot marks the lifetime start, and the thin line spans the half-open
-lifetime. The y-axis is log₂ solver footprint bytes. A hollow point in the
-bottom gutter means the solver footprint is unknown or nonpositive; it does
-not imply a zero-sized tensor or establish HBM allocation. Select a use dot or
-the outlined lifetime-start point to inspect its buffer. Click/focus the plot
-pane to enable keyboard controls. Modified browser shortcuts and typing in
-controls are not intercepted.
+x-axis and zoom: up-arrows mark producer operations and down-arrows mark
+consumer operations when operation metadata exists. Otherwise, small dots mark
+recorded reference/use ticks; a larger outlined dot marks lifetime start. The thin
+line spans the half-open lifetime; the y-axis is log₂ solver footprint bytes. A
+hollow point in the bottom gutter means the solver footprint is unknown or
+nonpositive; it does not imply a zero-sized tensor or establish HBM allocation.
+Select an arrow, use dot, or outlined lifetime-start point to inspect its buffer.
+Click/focus the plot pane to enable keyboard controls. Modified browser
+shortcuts and typing in controls are not intercepted.
 Buffers with a known empty `consumer_op_indices` list are omitted from the
 nonresident plot and table because the graph records no consuming op for them.
 The omitted count is shown; entries remain in raw capture. Unknown (`null`) consumer
@@ -279,13 +280,14 @@ proves a real HBM allocation; inspect final bundle `allocation` metadata for
 HBM/HBM-pool placement. Neither establishes measured runtime HBM traffic.
 The searchable/filterable companion table is sorted lexicographically by its
 operation-links text (then by buffer name) and has a bounded-height region
-with independent vertical scrolling and sticky column headers. It retains
-overlapping points and source context. The right-side selection panel can be
-collapsed; selecting a buffer or operation opens it again. Generated HTML has
-pre-rendered charts, log-size y-labels, numeric x-axes and table rows even
-when local JavaScript is disabled; hover/focus tooltips, zoom and filtering
-require JavaScript. Use the operation ledger for FX source context and JSONL
-for downstream analysis. Both plots show static frontend planning only:
+with independent vertical scrolling and sticky column headers. The details panel
+can be collapsed entirely to free the column; a compact `Show selected details`
+button reopens it. When open, it fills the plots row and long selections scroll
+inside it. Detail fields with unknown or null values are hidden.
+Generated HTML has pre-rendered charts, log-size y-labels, numeric x-axes
+and table rows even when local JavaScript is disabled; hover/focus tooltips,
+zoom and filtering require JavaScript.
+Use the operation ledger for FX source context and JSONL for downstream analysis. Both plots show static frontend planning only:
 nonresident points do not prove measured HBM traffic.
 Older captures without added metadata remain inspectable with unknown
 fields shown as unavailable.

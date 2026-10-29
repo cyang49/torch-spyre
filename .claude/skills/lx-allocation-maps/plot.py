@@ -36,8 +36,24 @@ PALETTE = (
 )
 
 
+def _reason_fields(buffer: dict) -> list[tuple[str, str]]:
+    spill = buffer.get("spill_reason")
+    residency = buffer.get("residency_reason")
+    if spill is None and residency is None:
+        return [("Reason", "unknown")]
+    if spill is not None and spill == residency:
+        return [("Reason", spill)]
+    fields = []
+    if spill is not None:
+        fields.append(("Solver outcome", spill))
+    if residency is not None:
+        fields.append(("LX eligibility", residency))
+    return fields
+
+
 def _static_preview(record: dict) -> tuple[str, str, str]:
     """Keep the maps and table visible in HTML previews that disable JavaScript."""
+    capacity = max(record["capacity_bytes"], 1)
     buffers = record["buffers"]
     resident = [b for b in buffers if b["address_bytes"] is not None]
     rejected = [
@@ -63,6 +79,7 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
         for b in buffers
         if b["address_bytes"] is None and b not in rejected and b not in no_consumers
     ]
+
     ticks = record["timeline"]
     max_tick = max(
         [
@@ -89,21 +106,46 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
         f'<text x="{x(t):.2f}" y="281" text-anchor="middle" class="axis-label">{t}</text>'
         for t in marks
     )
-    capacity = max(record["capacity_bytes"], 1)
-    resident_shapes = "".join(
-        f'<rect class="buffer{" relayout" if b.get("is_synthetic_relayout") else ""}'
-        f'{" peak" if b["address_bytes"] + b["reserved_size_bytes"] == record["global_watermark_bytes"] and record["global_watermark_bytes"] else ""}" '
-        f'x="{x(b["start_time"]):.2f}" '
-        f'y="{30 + 430 * (1 - (b["address_bytes"] + b["reserved_size_bytes"]) / capacity):.2f}" '
-        f'width="{max(1, x(b["end_time"]) - x(b["start_time"])):.2f}" '
-        f'height="{max(1, b["reserved_size_bytes"] * 430 / capacity):.2f}">'
-        f"<title>{html.escape(b['name'])}: "
-        f"LX {b['address_bytes']:,} B, {b['reserved_size_bytes']:,} B per core</title></rect>"
-        for b in resident
+    loop_stripe = (
+        '<line x1="75" x2="95" y1="536" y2="536" '
+        'stroke="#ff00a8" stroke-width="4"/>'
+        '<text x="101" y="540" class="axis-label">while_loop_ buffer</text>'
     )
+    resident_shapes = []
+    for b in resident:
+        buffer_class = "buffer"
+        if b.get("is_synthetic_relayout"):
+            buffer_class += " relayout"
+        if b["name"].startswith("while_loop_"):
+            buffer_class += " while-loop"
+        if (
+            b["address_bytes"] + b["reserved_size_bytes"]
+            == record["global_watermark_bytes"]
+            and record["global_watermark_bytes"]
+        ):
+            buffer_class += " peak"
+        resident_shapes.append(
+            f'<rect class="{buffer_class}" '
+            f'x="{x(b["start_time"]):.2f}" '
+            f'y="{30 + 430 * (1 - (b["address_bytes"] + b["reserved_size_bytes"]) / capacity):.2f}" '
+            f'width="{max(1, x(b["end_time"]) - x(b["start_time"])):.2f}" '
+            f'height="{max(1, b["reserved_size_bytes"] * 430 / capacity):.2f}">'
+            f"<title>{html.escape(b['name'])}: LX {b['address_bytes']:,} B, {b['reserved_size_bytes']:,} B per core</title></rect>"
+        )
+        if b["name"].startswith("while_loop_"):
+            center_y = 30 + 430 * (
+                1 - (b["address_bytes"] + b["reserved_size_bytes"] / 2) / capacity
+            )
+            resident_shapes.append(
+                f'<line x1="{x(b["start_time"]):.2f}" '
+                f'x2="{x(b["end_time"]):.2f}" '
+                f'y1="{center_y:.2f}" y2="{center_y:.2f}" '
+                'class="while-loop-stripe"/>'
+            )
+    resident_shapes = "".join(resident_shapes)
     lx_svg = (
         '<line x1="75" y1="500" x2="1175" y2="500" class="axis"/>'
-        f"{resident_shapes}{lx_axis}"
+        f"{resident_shapes}{lx_axis}{loop_stripe}"
         '<text x="75" y="549" class="axis-label">Allocator tick</text>'
     )
     sizes = [
@@ -113,6 +155,18 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
     low = math.floor(math.log2(min(positive))) if positive else 0
     high = math.ceil(math.log2(max(positive))) if positive else 0
     spread = max(high - low, 1)
+    timeline_ticks = {
+        entry["op_index"]: entry.get("allocation_tick", entry["op_index"])
+        for entry in ticks
+        if isinstance(entry.get("op_index"), int)
+    }
+    half_operation = record.get("allocation_time_unit") == "half_operation"
+
+    def operation_tick(index: int) -> int:
+        if index in timeline_ticks:
+            return timeline_ticks[index]
+        return 2 * index + 1 if half_operation else index
+
     y_labels = "".join(
         f'<line x1="75" x2="1175" y1="{22 + (high - power) * 210 / spread:.2f}" '
         f'y2="{22 + (high - power) * 210 / spread:.2f}" class="grid"/>'
@@ -127,17 +181,44 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
         size = b.get("allocated_size_bytes", b.get("logical_size_bytes"))
         valid = isinstance(size, (int, float)) and size > 0
         y = 22 + (high - math.log2(size)) * 210 / spread if valid else 259
-        state = " relayout" if b.get("is_synthetic_relayout") else ""
-        uses = sorted(set(b.get("uses") or []))
-        markers = "".join(
-            f'<circle cx="{x(tick):.2f}" cy="{y:.2f}" r="3" '
-            f'class="nonresident-use{state}" aria-hidden="true"/>'
-            for tick in uses
+        is_while_loop = b["name"].startswith("while_loop_")
+        state = (" relayout" if b.get("is_synthetic_relayout") else "") + (
+            " while-loop" if is_while_loop else ""
         )
+        uses = sorted(set(b.get("uses") or []))
+        producer = b.get("producer_op_index")
+        consumers = b.get("consumer_op_indices")
+        has_operation_metadata = isinstance(producer, int) or isinstance(
+            consumers, list
+        )
+        markers = []
+        if has_operation_metadata:
+            if isinstance(producer, int) and 0 <= producer < len(ticks):
+                markers.append(
+                    f'<text x="{x(operation_tick(producer)):.2f}" y="{y - 4:.2f}" '
+                    f'class="nonresident-marker producer{state}" '
+                    f'aria-label="Producer operation {producer} for {html.escape(b["name"])}">'
+                    f"↑<title>Producer operation {producer}</title></text>"
+                )
+            if isinstance(consumers, list):
+                for consumer in sorted(set(consumers)):
+                    if isinstance(consumer, int) and 0 <= consumer < len(ticks):
+                        markers.append(
+                            f'<text x="{x(operation_tick(consumer)):.2f}" y="{y + 14:.2f}" '
+                            f'class="nonresident-marker consumer{state}" '
+                            f'aria-label="Consumer operation {consumer} for {html.escape(b["name"])}">'
+                            f"↓<title>Consumer operation {consumer}</title></text>"
+                        )
+        else:
+            markers.extend(
+                f'<circle cx="{x(tick):.2f}" cy="{y:.2f}" r="3" '
+                f'class="nonresident-use{state}" aria-hidden="true"/>'
+                for tick in uses
+            )
         points.append(
             f'<line x1="{x(b["start_time"]):.2f}" x2="{x(b["end_time"]):.2f}" '
             f'y1="{y:.2f}" y2="{y:.2f}" class="nonresident-interval{state}"/>'
-            f"{markers}"
+            f"{''.join(markers)}"
             f'<circle cx="{x(b["start_time"]):.2f}" cy="{y:.2f}" r="4" '
             f'class="nonresident-point{" unsized" if not valid else ""}{state}">'
             f"<title>{html.escape(b['name'])}: solver footprint "
@@ -149,6 +230,8 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
         '<line x1="75" y1="22" x2="75" y2="259" class="axis"/>'
         '<line x1="75" y1="259" x2="1175" y2="259" class="axis"/>'
         '<text x="68" y="263" text-anchor="end" class="axis-label">unsized</text>'
+        '<line x1="75" x2="95" y1="286" y2="286" stroke="#ff00a8" stroke-width="4"/>'
+        '<text x="101" y="290" class="axis-label">while_loop_ buffer</text>'
         + y_labels
         + "".join(points)
         + nonresident_axis
@@ -157,7 +240,7 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
     rows = "".join(
         "<tr>"
         f"<td>{html.escape(b['name'])}</td>"
-        f"<td>{html.escape(str(b.get('spill_reason') or b.get('residency_reason') or 'unknown'))}</td>"
+        f"<td>{html.escape('; '.join(f'{label}: {value}' for label, value in _reason_fields(b)))}</td>"
         f"<td>{html.escape(str(b.get('host_shape')))} / {html.escape(str(b.get('host_dtype')))}</td>"
         f"<td>{html.escape(str(b.get('spyre_tensor_layout')))}</td>"
         f"<td>{html.escape(str(b.get('allocated_size_bytes', b.get('logical_size_bytes'))))} B solver footprint</td>"
@@ -198,6 +281,8 @@ input[type=search]{min-width:20rem;max-width:100%}
 .panel{background:white;border:1px solid #c8d3e0;border-radius:6px;padding:1rem;margin:1rem 0}
 .split{display:grid;grid-template-columns:minmax(0,3fr) minmax(19rem,1fr);gap:1rem}
 .split.details-closed{grid-template-columns:minmax(0,1fr) auto}
+#details-panel:not([open]){display:none}
+#open-details{position:sticky;top:1rem;align-self:start;z-index:2}
 @media(max-width:850px){.split{grid-template-columns:1fr}}
 #details-panel summary{cursor:pointer;font-weight:600}
 .map-scroll,.table-scroll{overflow:auto;max-width:100%}
@@ -213,6 +298,20 @@ svg .buffer{fill:#397db8;fill-opacity:.48;stroke:#24577f;stroke-width:1;cursor:p
 svg .buffer.peak{fill:#e58a32;stroke:#9c4c17}
 svg .buffer.relayout{fill:#168c9a;stroke:#075c66;fill-opacity:.72}
 svg .buffer.relayout.peak{stroke:#9c4c17;stroke-width:2.5}
+svg .buffer.while-loop{fill:#ff00a8;stroke:#7a004f;fill-opacity:.9}
+svg .buffer.while-loop.peak{stroke:#9c4c17;stroke-width:2.5}
+svg .nonresident-interval.while-loop{stroke:#ff00a8;stroke-opacity:.95;stroke-width:3}
+svg .nonresident-point.while-loop{fill:#ff00a8;stroke:#7a004f}
+svg .nonresident-interval{stroke:#8162a6;stroke-width:2;stroke-opacity:.55;pointer-events:none}
+svg .nonresident-interval.relayout{stroke:#168c9a}
+svg .nonresident-use{fill:#172739;stroke:white;stroke-width:.8;cursor:pointer}
+svg .nonresident-use.relayout{fill:#075c66}
+svg .nonresident-use:hover,svg .nonresident-use:focus,svg .nonresident-use.selected,svg .nonresident-use.related{stroke:#e58a32;stroke-width:2.5}
+svg .nonresident-marker{font:16px system-ui,sans-serif;font-weight:700;text-anchor:middle;dominant-baseline:middle;cursor:pointer;fill:#14548e;pointer-events:all}
+svg .nonresident-marker.consumer{fill:#a33b20}
+svg .nonresident-use.while-loop{fill:#7a004f;stroke:#ff00a8}
+svg .nonresident-marker.while-loop{fill:#ff00a8}
+svg .while-loop-stripe{stroke:#ff00a8;stroke-width:4;pointer-events:none}
 svg .buffer:hover,svg .buffer:focus,svg .buffer.selected,svg .buffer.related{fill-opacity:.85;stroke:#121f32;stroke-width:2}
 svg .watermark{fill:none;stroke:#c72d32;stroke-width:2;pointer-events:none}
 svg .capacity{stroke:#666;stroke-dasharray:6 4;pointer-events:none}
@@ -227,21 +326,21 @@ svg .capacity{stroke:#666;stroke-dasharray:6 4;pointer-events:none}
 .swatch.nonresident{background:#8162a6;border-color:#46305f;opacity:1}
 .swatch.unsized{background:white;border:2px dashed #46305f;opacity:1}
 .swatch.use{width:.45rem;height:.45rem;border-radius:50%;background:#172739;border-color:white;box-shadow:0 0 0 1px #172739;opacity:1}
+.swatch.while-loop{background:#ff00a8;border-color:#7a004f;opacity:1}
+svg .op-tick.while-loop{fill:#ff00a8!important;stroke:#3b0026;stroke-width:1.5}
+svg .op-tick.while-loop.op-tick.associated,svg .op-tick.while-loop.op-tick.selected{stroke:#fff;stroke-width:3}
 svg .op-tick{stroke:#fff;stroke-width:.6;cursor:pointer}
 svg .op-index{font:10px system-ui,sans-serif;fill:#fff;pointer-events:none}
-svg .nonresident-interval{stroke:#8162a6;stroke-width:2;stroke-opacity:.55;pointer-events:none}
-svg .nonresident-interval.relayout{stroke:#168c9a}
-svg .nonresident-use{fill:#172739;stroke:white;stroke-width:.8;cursor:pointer}
-svg .nonresident-use.relayout{fill:#075c66}
-svg .nonresident-use:hover,svg .nonresident-use:focus,svg .nonresident-use.selected,svg .nonresident-use.related{stroke:#e58a32;stroke-width:2.5}
 svg .nonresident-point{fill:#fff;stroke:#46305f;stroke-width:1.5;cursor:pointer}
 svg .nonresident-point.relayout{fill:#168c9a;stroke:#075c66}
 svg .nonresident-point.unsized{fill:#fff;stroke-dasharray:2 1}
 svg .nonresident-point:hover,svg .nonresident-point:focus,svg .nonresident-point.selected,svg .nonresident-point.related{stroke:#121f32;stroke-width:2.5}
 svg .op-tick.associated,svg .op-tick.selected{stroke:#151d32;stroke-width:3}
 svg [tabindex]:focus-visible{outline:2px solid #172739;outline-offset:1px}
- .chart-stack:focus-visible{outline:2px solid #14548e;outline-offset:2px}
-.details{overflow-wrap:anywhere;max-height:38rem;overflow:auto}
+#details-panel{display:flex;flex-direction:column;min-height:0;align-self:stretch}
+#details-panel>.details{flex:1;min-height:0;max-height:none;overflow:auto}
+.chart-stack:focus-visible{outline:2px solid #14548e;outline-offset:2px}
+.details{overflow-wrap:anywhere;min-height:0;overflow:auto}
 .field{margin:.35rem 0}.field strong{display:inline-block;margin-right:.4rem}
 .details button,td button{border:0;background:transparent;color:#14548e;text-decoration:underline;cursor:pointer;padding:0 .2rem}
 .details button:focus-visible,td button:focus-visible{outline:2px solid #14548e}
@@ -272,22 +371,24 @@ Show selected LX relayout copies <span id="synthetic-count"></span></label></div
 <span><i class="swatch relayout-peak" aria-hidden="true"></i>Relayout buffer at peak LX address</span>
 <span><i class="swatch peak" aria-hidden="true"></i>Buffer reaching the highest LX address</span>
 <span><i class="swatch watermark" aria-hidden="true"></i>Highest live LX address at each tick</span>
-<span><i class="swatch capacity" aria-hidden="true"></i>Planner LX capacity</span></div>
+<span><i class="swatch capacity" aria-hidden="true"></i>Planner LX capacity</span>
+<span><i class="swatch while-loop" aria-hidden="true"></i>while_loop_ buffer</span></div>
 <p class="muted">The operation strip reuses its palette by operation type; select a tick for its exact type. Synthetic relayout copies are LX planning entries, not standalone graph operations.</p>
 <details><summary>Operation strip color key</summary><div id="op-legend" class="legend"></div></details>
 <div class="chart-stack" id="charts" tabindex="0" role="region" aria-label="Allocation plots shown full height. Move pointer horizontally to set zoom focus; W/S zoom, A/D pan"><div class="map-scroll"><svg id="map" width="1201" height="557" viewBox="0 0 1201 557" aria-label="LX allocation address and operation timeline">__LX_PREVIEW__</svg></div>
 <h2>Nonresident graph-buffer size and lifetime</h2>
-<p class="muted">Each small dot marks a recorded buffer reference/use tick; the line spans the half-open lifetime [start, end), and the larger hollow dot marks lifetime start. Y shows log₂ solver footprint bytes. W/S zoom in or out around the pointer's horizontal position; A/D pan horizontally. Both plots display full height and scroll horizontally only.</p>
-<div class="legend" aria-label="Nonresident plot legend"><span><i class="swatch nonresident" aria-hidden="true"></i>Positive solver footprint</span><span><i class="swatch unsized" aria-hidden="true"></i>Unknown/nonpositive solver footprint</span><span><i class="swatch use" aria-hidden="true"></i>Recorded reference/use tick</span></div>
-<div class="map-scroll"><svg id="nonresident-map" width="1201" height="307" viewBox="0 0 1201 307" aria-label="Nonresident buffer solver footprint and lifetime with a marker at each recorded use tick">__NONRESIDENT_PREVIEW__</svg></div></div>
+<p class="muted">Up-arrows mark producer operations and down-arrows mark consumers when operation metadata exists; otherwise, small dots mark recorded use ticks. The larger hollow dot marks lifetime start, and the thin line spans the half-open lifetime. Y shows log₂ solver footprint bytes. W/S zoom around pointer; A/D pans horizontally.</p>
+<div class="legend" aria-label="Nonresident plot legend"><span><i class="swatch unsized" aria-hidden="true"></i>Lifetime start</span><span><i class="swatch use" aria-hidden="true"></i>Recorded use tick (without operation metadata)</span><span>↑ Producer operation</span><span>↓ Consumer operation</span></div>
+<div class="map-scroll"><svg id="nonresident-map" width="1201" height="307" viewBox="0 0 1201 307" aria-label="Nonresident buffer solver footprint and lifetime with producer, consumer, and reference markers">__NONRESIDENT_PREVIEW__</svg></div></div>
 <p id="resident-count" class="muted"></p></section>
+<button type="button" id="open-details" aria-controls="details-panel" hidden>Show selected details</button>
 <details id="details-panel" class="panel" open><summary>Selected buffer or operation</summary>
 <div id="details" class="details" aria-live="polite">Select a buffer or operation.</div></details></div>
 <section class="panel"><h2>Nonresident graph buffers (no LX address)</h2>
 <div class="controls"><label>Search <input id="search" type="search" placeholder="Name, shape, dtype, layout, reason…"></label>
 <label>Reason <select id="reason"><option value="">All reasons</option></select></label></div>
 <p id="nonresident-count" class="muted"></p><div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable nonresident buffer table"><table>
-<thead><tr><th>Buffer</th><th>Reason / status</th><th>Host shape / dtype</th>
+<thead><tr><th>Buffer</th><th>Solver / eligibility reason</th><th>Host shape / dtype</th>
 <th>Spyre device layout</th><th>Solver footprint</th><th>Operation links</th></tr></thead>
 <tbody id="nonresident-rows">__ROWS_PREVIEW__</tbody></table></div></section>
 <div id="tooltip" role="tooltip" hidden></div>
@@ -347,7 +448,20 @@ const layoutText = b => {
 const sizeText = b => b.allocated_size_bytes != null ? bytes(b.allocated_size_bytes)
   : b.logical_size_bytes != null ? `${bytes(b.logical_size_bytes)} (legacy solver footprint)` : "unknown";
 const footprint = b => b.allocated_size_bytes ?? b.logical_size_bytes;
-const reason = b => format(b.spill_reason ?? b.residency_reason);
+const reasonValues = b => {
+  const spill = b.spill_reason, residency = b.residency_reason;
+  if (spill == null && residency == null) return ["unknown"];
+  return [...new Set([spill, residency].filter(value => value != null).map(format))];
+};
+const reasonFields = b => {
+  const spill = b.spill_reason, residency = b.residency_reason;
+  if (spill == null && residency == null) return [["Reason", "unknown"]];
+  if (spill != null && spill === residency) return [["Reason", spill]];
+  const fields = [];
+  if (spill != null) fields.push(["Solver outcome", spill]);
+  if (residency != null) fields.push(["LX eligibility", residency]);
+  return fields;
+};
 const operationIndices = b => {
   const result = new Set();
   if (Number.isInteger(b.producer_op_index) && b.producer_op_index >= 0 && b.producer_op_index < operations.length)
@@ -364,6 +478,7 @@ const linkText = b => operationIndices(b).map(i => `op ${i}`).join(", ");
 let selectedBuffer = null, selectedOp = null;
 const rects = new Map(), opRects = new Map(), rows = new Map(), points = new Map(), usePoints = new Map();
 function field(parent, label, value) {
+  if (value == null || (typeof value === "string" && value.trim().toLowerCase() === "unknown")) return;
   const line = document.createElement("div");
   line.className = "field";
   const strong = document.createElement("strong");
@@ -388,12 +503,9 @@ function bufferButton(parent, b) {
 function describeBuffer(b, parent, links) {
   field(parent, "Buffer", b.name);
   field(parent, "Residency", b.address_bytes == null ? "nonresident" : "LX resident");
-  field(parent, "Reason", reason(b));
-  field(parent, "Spill reason", b.spill_reason);
-  field(parent, "Residency reason", b.residency_reason);
+  for (const [label, value] of reasonFields(b)) field(parent, label, value);
   field(parent, "Metadata status", b.metadata_status);
   field(parent, "Host shape", b.host_shape);
-  field(parent, "Host strides", b.host_strides);
   field(parent, "Host dtype", b.host_dtype);
   field(parent, "Spyre device size", layout(b).device_size);
   field(parent, "Spyre stride map", layout(b).stride_map);
@@ -443,9 +555,9 @@ function refreshSelection() {
     point.classList.toggle("selected", selectedBuffer === b);
     point.classList.toggle("related", selectedOp !== null && operationIndices(b).includes(selectedOp));
   }
-  for (const [b, uses] of usePoints) for (const use of uses) {
-    use.classList.toggle("selected", selectedBuffer === b);
-    use.classList.toggle("related", selectedOp !== null && operationIndices(b).includes(selectedOp));
+  for (const [b, markers] of usePoints) for (const marker of markers) {
+    marker.classList.toggle("selected", selectedBuffer === b);
+    marker.classList.toggle("related", selectedOp !== null && operationIndices(b).includes(selectedOp));
   }
   for (const [b, row] of rows) {
     row.classList.toggle("selected", selectedBuffer === b);
@@ -520,7 +632,7 @@ function drawMap() {
     const rect = svg("rect", {x:x(b.start_time),y:y(b.address_bytes + b.reserved_size_bytes),
       width:Math.max(1,x(b.end_time)-x(b.start_time)),
       height:Math.max(1,b.reserved_size_bytes * plotHeight / Math.max(capacity,1)),
-      class:`buffer${synthetic(b) ? " relayout" : ""}${peakBuffers.has(b.name) ? " peak" : ""}`,tabindex:0,role:"button",
+      class:`buffer${synthetic(b) ? " relayout" : ""}${b.name.startsWith("while_loop_") ? " while-loop" : ""}${peakBuffers.has(b.name) ? " peak" : ""}`,tabindex:0,role:"button",
       "aria-label":`${format(b.name)} at LX address ${bytes(b.address_bytes)}; select for details`});
     rect.addEventListener("pointerenter", () => showTooltip(b));
     rect.addEventListener("pointerleave", () => $("tooltip").hidden = true);
@@ -554,17 +666,21 @@ function drawMap() {
   opLegend.replaceChildren();
   for (const [i, type] of types.entries()) {
     const item = document.createElement("span"), swatch = document.createElement("i");
-    swatch.className = "swatch";
-    swatch.style.background = palette[i % palette.length];
+    const isWhileLoop = type === "while_loop";
+    swatch.className = `swatch${isWhileLoop ? " while-loop" : ""}`;
+    swatch.style.background = isWhileLoop ? "#ff00a8" : palette[i % palette.length];
     swatch.setAttribute("aria-hidden", "true");
     item.append(swatch, document.createTextNode(type));
     opLegend.append(item);
   }
   for (const [i, op] of operations.entries()) {
     const tick = opTick(i), px = x(tick);
+    const opType = String(op.op_type || "unknown");
+    const isWhileLoop = opType === "while_loop";
     const rect = svg("rect", {x:px,y:railY,width:Math.max(1,plotWidth/maxTick),height:24,
-      fill:palette[types.indexOf(String(op.op_type || "unknown")) % palette.length],
-      class:"op-tick",role:"button",tabindex:0,"aria-label":`Operation ${i}: ${format(op.operation_name || op.op_type)}`});
+      fill:isWhileLoop ? "#ff00a8" : palette[types.indexOf(opType) % palette.length],
+      class:`op-tick${isWhileLoop ? " while-loop" : ""}`,role:"button",tabindex:0,
+      "aria-label":`Operation ${i}: ${format(op.operation_name || op.op_type)}`});
     const title = svg("title", {});
     title.textContent = `Operation ${i} at tick ${tick}: ${format(op.operation_name || op.op_type)}`;
     rect.append(title);
@@ -628,28 +744,60 @@ function drawNonresidentMap() {
     const start = Math.max(0, Number(b.start_time) || 0);
     const end = Math.max(start, Number(b.end_time) || start);
     const interval = svg("line", {x1:x(start),y1:lineY,x2:x(end),y2:lineY,
-      class:`nonresident-interval${synthetic(b) ? " relayout" : ""}`});
+      class:`nonresident-interval${synthetic(b) ? " relayout" : ""}${b.name.startsWith("while_loop_") ? " while-loop" : ""}`});
     map.append(interval);
     const bufferUses = [];
-    const uses = [...new Set((b.uses || []).map(Number).filter(Number.isFinite))].sort((a, b) => a - b);
-    for (const tick of uses) {
-      const use = svg("circle", {cx:x(tick),cy:lineY,r:3,
-        class:`nonresident-use${synthetic(b) ? " relayout" : ""}`,tabindex:0,role:"button",
-        "aria-label":`${format(b.name)} reference at ${tickLabel(tick)}`});
-      use.addEventListener("pointerenter", () => showTooltip(b));
-      use.addEventListener("pointerleave", () => $("tooltip").hidden = true);
-      use.addEventListener("focus", () => showTooltip(b));
-      use.addEventListener("blur", () => $("tooltip").hidden = true);
-      use.addEventListener("click", () => selectBuffer(b));
-      use.addEventListener("keydown", e => {
+    const producer = b.producer_op_index;
+    const consumers = b.consumer_op_indices;
+    const hasOperationMetadata = Number.isInteger(producer) || Array.isArray(consumers);
+    const markerNodes = [];
+    const addMarker = (operation, direction, kind) => {
+      if (!Number.isInteger(operation) || operation < 0 || operation >= operations.length) return;
+      const marker = svg("text", {x:x(opTick(operation)),y:lineY + direction * 7,
+        class:`nonresident-marker ${kind}${synthetic(b) ? " relayout" : ""}${b.name.startsWith("while_loop_") ? " while-loop" : ""}`,
+        tabindex:0,role:"button",
+        "aria-label":`${kind === "producer" ? "Producer" : "Consumer"} operation ${operation} for ${format(b.name)}`});
+      marker.textContent = direction < 0 ? "↑" : "↓";
+      const title = svg("title", {});
+      title.textContent = `${kind === "producer" ? "Producer" : "Consumer"} operation ${operation}`;
+      marker.append(title);
+      marker.addEventListener("pointerenter", () => showTooltip(b));
+      marker.addEventListener("pointerleave", () => $("tooltip").hidden = true);
+      marker.addEventListener("focus", () => showTooltip(b));
+      marker.addEventListener("blur", () => $("tooltip").hidden = true);
+      marker.addEventListener("click", () => selectBuffer(b));
+      marker.addEventListener("keydown", e => {
         if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectBuffer(b); }
       });
-      map.append(use);
-      bufferUses.push(use);
+      map.append(marker);
+      markerNodes.push(marker);
+    };
+    if (hasOperationMetadata) {
+      addMarker(producer, -1, "producer");
+      if (Array.isArray(consumers)) for (const consumer of [...new Set(consumers)])
+        addMarker(consumer, 1, "consumer");
+    } else {
+      const uses = [...new Set((b.uses || []).map(Number).filter(Number.isFinite))]
+        .sort((a, b) => a - b);
+      for (const tick of uses) {
+        const use = svg("circle", {cx:x(tick),cy:lineY,r:3,
+          class:`nonresident-use${synthetic(b) ? " relayout" : ""}${b.name.startsWith("while_loop_") ? " while-loop" : ""}`,tabindex:0,role:"button",
+          "aria-label":`${format(b.name)} reference at ${tickLabel(tick)}`});
+        use.addEventListener("pointerenter", () => showTooltip(b));
+        use.addEventListener("pointerleave", () => $("tooltip").hidden = true);
+        use.addEventListener("focus", () => showTooltip(b));
+        use.addEventListener("blur", () => $("tooltip").hidden = true);
+        use.addEventListener("click", () => selectBuffer(b));
+        use.addEventListener("keydown", e => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectBuffer(b); }
+        });
+        map.append(use);
+        bufferUses.push(use);
+      }
     }
-    usePoints.set(b, bufferUses);
+    usePoints.set(b, [...bufferUses, ...markerNodes]);
     const point = svg("circle", {cx:x(start),cy:lineY,r:4,
-      class:`nonresident-point${synthetic(b) ? " relayout" : ""}${valid ? "" : " unsized"}`,tabindex:0,role:"button",
+      class:`nonresident-point${synthetic(b) ? " relayout" : ""}${b.name.startsWith("while_loop_") ? " while-loop" : ""}${valid ? "" : " unsized"}`,tabindex:0,role:"button",
       "aria-label":`${format(b.name)}: nonresident, solver footprint ${sizeText(b)}`});
     point.addEventListener("pointerenter", () => showTooltip(b));
     point.addEventListener("pointerleave", () => $("tooltip").hidden = true);
@@ -687,7 +835,7 @@ function setZoom(value, fit = false, anchorX = null) {
   mapScroll.scrollLeft = fit ? 0 : 75 + position * plotWidthAtScale() - x;
 }
 function fillTable() {
-  const reasons = [...new Set(nonresident.map(reason))].sort();
+  const reasons = [...new Set(nonresident.flatMap(reasonValues))].sort();
   for (const name of reasons) {
     const option = document.createElement("option");
     option.value = name;
@@ -715,7 +863,8 @@ function fillTable() {
     };
     const name = cell("");
     bufferButton(name, b);
-    cell(`${reason(b)} · metadata: ${format(b.metadata_status)}`);
+    cell(reasonFields(b).map(([label, value]) => `${label}: ${format(value)}`).join(" · ") +
+      (b.metadata_status == null ? "" : ` · metadata: ${format(b.metadata_status)}`));
     cell(`${format(b.host_shape)} / ${format(b.host_dtype)}`);
     cell(layoutText(b));
     cell(sizeText(b));
@@ -734,11 +883,13 @@ function filterBuffers() {
   for (const [b, rect] of rects) rect.style.display = synthetic(b) && !show ? "none" : "";
   let visible = 0;
   for (const [b, row] of rows) {
-    const searchable = [format(b.name), reason(b), format(b.metadata_status),
+    const searchable = [format(b.name), reasonValues(b).join(" "), format(b.metadata_status),
       format(b.host_shape), format(b.host_strides), format(b.host_dtype),
       layoutText(b), sizeText(b), bytes(b.reserved_size_bytes),
-      ...(b.uses || []).map(tickLabel), ...operationIndices(b).map(i => `op ${i}`)].join(" ").toLowerCase();
-    row.hidden = (synthetic(b) && !show) || (selectedReason && reason(b) !== selectedReason) ||
+      ...(b.uses || []).map(tickLabel), ...operationIndices(b).map(i => `op ${i}`)]
+      .join(" ").toLowerCase();
+    row.hidden = (synthetic(b) && !show) ||
+      (selectedReason && !reasonValues(b).includes(selectedReason)) ||
       (query && !searchable.includes(query));
     if (!row.hidden) visible++;
     const point = points.get(b);
@@ -754,6 +905,7 @@ function filterBuffers() {
 $("title").textContent = `${format(data.aot_graph_name || "unnamed graph")} — interactive LX allocation map`;
 $("summary").textContent = `${operations.length} operations · ${resident.length} LX-resident · ${nonresident.length} nonresident graph buffers · watermark ${bytes(data.global_watermark_bytes)} / capacity ${bytes(data.capacity_bytes)} · Inductor graph ID ${format(data.inductor_graph_id)}`;
 $("no-consumer-count").textContent = `${noConsumerBuffers.length} known no-consumer buffers omitted from the nonresident plot and table; retained in raw capture.`;
+$("synthetic-count").textContent = `(${resident.filter(synthetic).length} selected)`;
 $("show-synthetic").addEventListener("change", filterBuffers);
 $("search").addEventListener("input", filterBuffers);
 $("reason").addEventListener("change", filterBuffers);
@@ -785,7 +937,15 @@ $("zoom-in").addEventListener("click", () => setZoom(Number(zoom.value) + 1));
 zoom.addEventListener("input", e => setZoom(e.target.value));
 window.addEventListener("resize", () => setZoom(zoom.value, Number(zoom.value) === 0));
 $("details-panel").addEventListener("toggle", () => {
-  $("details-panel").parentElement.classList.toggle("details-closed", !$("details-panel").open);
+  const closed = !$("details-panel").open;
+  $("details-panel").parentElement.classList.toggle("details-closed", closed);
+  $("open-details").hidden = !closed;
+  setZoom(zoom.value, Number(zoom.value) === 0);
+});
+$("open-details").addEventListener("click", () => {
+  $("details-panel").open = true;
+  $("open-details").hidden = true;
+  $("details-panel").parentElement.classList.remove("details-closed");
   setZoom(zoom.value, Number(zoom.value) === 0);
 });
 drawMap();
@@ -852,12 +1012,12 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
         and watermark
     }
 
-    figure, (allocation_ax, op_ax) = plt.subplots(
-        2,
+    figure, (allocation_ax, nonresident_ax, op_ax) = plt.subplots(
+        3,
         1,
-        figsize=(18, 9),
+        figsize=(18, 11),
         sharex=True,
-        gridspec_kw={"height_ratios": (4, 0.7)},
+        gridspec_kw={"height_ratios": (4, 1.5, 0.7)},
         layout="constrained",
     )
     figure.suptitle(
@@ -876,16 +1036,37 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 (start, address),
                 end - start,
                 extent,
-                facecolor=PALETTE[6]
+                facecolor="#ff00a8"
+                if buffer["name"].startswith("while_loop_")
+                else PALETTE[6]
                 if buffer.get("is_synthetic_relayout")
                 else (PALETTE[1] if is_peak else PALETTE[0]),
-                edgecolor="#9c4c17"
+                edgecolor="#3b0026"
+                if buffer["name"].startswith("while_loop_")
+                else "#9c4c17"
                 if is_peak
                 else ("#075c66" if buffer.get("is_synthetic_relayout") else "#24577f"),
-                alpha=0.72 if is_peak or buffer.get("is_synthetic_relayout") else 0.38,
-                linewidth=2 if is_peak and buffer.get("is_synthetic_relayout") else 0.7,
+                alpha=0.9
+                if buffer["name"].startswith("while_loop_")
+                else 0.72
+                if is_peak or buffer.get("is_synthetic_relayout")
+                else 0.38,
+                linewidth=2
+                if buffer["name"].startswith("while_loop_")
+                or (is_peak and buffer.get("is_synthetic_relayout"))
+                else 0.7,
             )
         )
+        if buffer["name"].startswith("while_loop_"):
+            allocation_ax.add_line(
+                Line2D(
+                    [start, end],
+                    [address + extent / 2, address + extent / 2],
+                    color="#ff00a8",
+                    linewidth=4,
+                    zorder=3,
+                )
+            )
         if end - start >= 1.5 and extent >= 16384:
             allocation_ax.text(
                 (start + end) / 2,
@@ -896,6 +1077,17 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 fontsize=5.5,
                 clip_on=True,
             )
+    nonresident_buffers = [
+        buffer
+        for buffer in record["buffers"]
+        if buffer.get("address_bytes") is None
+        and not buffer.get("is_synthetic_relayout")
+        and not buffer["name"].startswith("__spyre_lx_relayout__")
+        and not (
+            isinstance(buffer.get("consumer_op_indices"), list)
+            and not buffer["consumer_op_indices"]
+        )
+    ]
     allocation_ax.step(
         [tick.get("allocation_tick", tick["op_index"]) for tick in timeline]
         + [max_tick],
@@ -933,7 +1125,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
                 alpha=0.72,
                 label="Buffer reaching the highest LX address",
             ),
-            Line2D([], [], color="#c72d32", label="Highest live LX address"),
+            Line2D([], [], color="#ff00a8", linewidth=4, label="while_loop_ buffer"),
             Line2D([], [], color="#666", linestyle="--", label="Planner LX capacity"),
         ],
         loc="upper left",
@@ -953,8 +1145,142 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
         dict.fromkeys(str(op.get("op_type") or "unknown") for op in operations)
     )
     type_colors = {
-        name: PALETTE[position % len(PALETTE)] for position, name in enumerate(op_types)
+        name: "#ff00a8" if name == "while_loop" else PALETTE[position % len(PALETTE)]
+        for position, name in enumerate(op_types)
     }
+    nonresident_buffers = [
+        buffer
+        for buffer in record["buffers"]
+        if buffer.get("address_bytes") is None
+        and not buffer.get("is_synthetic_relayout")
+        and not buffer["name"].startswith("__spyre_lx_relayout__")
+        and not (
+            isinstance(buffer.get("consumer_op_indices"), list)
+            and not buffer["consumer_op_indices"]
+        )
+    ]
+    footprint_sizes = [
+        buffer.get("allocated_size_bytes", buffer.get("logical_size_bytes"))
+        for buffer in nonresident_buffers
+    ]
+    valid_sizes = [
+        size for size in footprint_sizes if isinstance(size, (int, float)) and size > 0
+    ]
+    low = math.floor(math.log2(min(valid_sizes))) if valid_sizes else 0
+    high = math.ceil(math.log2(max(valid_sizes))) if valid_sizes else 0
+    span = max(high - low, 1)
+    for power in range(low, high + 1):
+        if valid_sizes and (
+            (power - low) % max(1, math.ceil(span / 6)) == 0 or power == high
+        ):
+            position = (high - power) / span
+            nonresident_ax.axhline(position, color="#dfe6ee", linewidth=0.7)
+            nonresident_ax.text(
+                -0.01,
+                position,
+                f"2^{power} B",
+                transform=nonresident_ax.transAxes,
+                ha="right",
+                va="center",
+                fontsize=7,
+            )
+    for buffer in nonresident_buffers:
+        size = buffer.get("allocated_size_bytes", buffer.get("logical_size_bytes"))
+        valid = isinstance(size, (int, float)) and size > 0
+        y = (high - math.log2(size)) / span if valid else -0.06
+        start, end = buffer["start_time"], buffer["end_time"]
+        loop_buffer = buffer["name"].startswith("while_loop_")
+        nonresident_ax.plot(
+            [start, end],
+            [y, y],
+            color="#ff00a8" if loop_buffer else "#8162a6",
+            linewidth=2.5 if loop_buffer else 1.6,
+            alpha=0.85,
+        )
+        nonresident_ax.scatter(
+            [start],
+            [y],
+            facecolors="none",
+            edgecolors="#ff00a8" if loop_buffer else "#46305f",
+            s=32,
+            linewidths=1.2,
+            zorder=4,
+        )
+        producer = buffer.get("producer_op_index")
+        if isinstance(producer, int) and 0 <= producer < len(timeline):
+            producer_tick = timeline[producer].get("allocation_tick", producer)
+            nonresident_ax.annotate(
+                "↑",
+                (producer_tick, y),
+                xytext=(0, 6),
+                textcoords="offset points",
+                ha="center",
+                color="#ff00a8" if loop_buffer else "#14548e",
+                fontsize=9,
+            )
+        for consumer in buffer.get("consumer_op_indices") or []:
+            if isinstance(consumer, int) and 0 <= consumer < len(timeline):
+                consumer_tick = timeline[consumer].get("allocation_tick", consumer)
+                nonresident_ax.annotate(
+                    "↓",
+                    (consumer_tick, y),
+                    xytext=(0, -8),
+                    textcoords="offset points",
+                    ha="center",
+                    color="#a33b20",
+                    fontsize=9,
+                )
+        if loop_buffer:
+            nonresident_ax.text(
+                (start + end) / 2,
+                y,
+                buffer["name"],
+                ha="center",
+                va="center",
+                fontsize=6,
+                color="#7a004f",
+                clip_on=True,
+            )
+    nonresident_ax.set(
+        xlim=(0, max(max_tick, 1)),
+        ylim=(-0.12, 1.08),
+        ylabel="Solver footprint",
+        title="Nonresident buffer lifetime by allocator tick",
+    )
+    nonresident_ax.set_yticks([])
+    nonresident_ax.set_xticks(range(0, max_tick + 1, max(1, max_tick // 16)))
+    nonresident_ax.grid(True, axis="x", alpha=0.15)
+    nonresident_ax.legend(
+        handles=[
+            Line2D(
+                [],
+                [],
+                color="#8162a6",
+                linewidth=1.6,
+                label="Nonresident buffer lifetime",
+            ),
+            Line2D([], [], color="#ff00a8", linewidth=2.5, label="while_loop_ buffer"),
+            Line2D(
+                [],
+                [],
+                color="#14548e",
+                marker=r"$\uparrow$",
+                linestyle="None",
+                label="Producer operation",
+            ),
+            Line2D(
+                [],
+                [],
+                color="#a33b20",
+                marker=r"$\downarrow$",
+                linestyle="None",
+                label="Consumer operation",
+            ),
+        ],
+        loc="upper right",
+        fontsize=7,
+        ncols=2,
+    )
     for operation in operations:
         op_type = str(operation.get("op_type") or "unknown")
         x = timeline[operation["op_index"]].get(
