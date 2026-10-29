@@ -279,12 +279,12 @@ h1,h2{line-height:1.25}h1{margin-bottom:.25rem}h2{font-size:1.1rem}
 .controls output{min-width:3.5rem;text-align:right;font-variant-numeric:tabular-nums}
 input[type=search]{min-width:20rem;max-width:100%}
 .panel{background:white;border:1px solid #c8d3e0;border-radius:6px;padding:1rem;margin:1rem 0}
-.split{display:grid;grid-template-columns:minmax(0,3fr) minmax(19rem,1fr);gap:1rem}
+.split{display:grid;grid-template-columns:minmax(0,3fr) minmax(19rem,1fr);gap:1rem;align-items:start}
 .split.details-closed{grid-template-columns:minmax(0,1fr) auto}
 #details-panel:not([open]){display:none}
 #open-details{position:sticky;top:1rem;align-self:start;z-index:2}
 @media(max-width:850px){.split{grid-template-columns:1fr}}
-#details-panel summary{cursor:pointer;font-weight:600}
+#details-panel summary{cursor:pointer;font-weight:600;flex:none}
 .map-scroll,.table-scroll{overflow:auto;max-width:100%}
 .table-scroll{max-height:32rem;overscroll-behavior:contain}
 .chart-stack{overflow-x:auto;overflow-y:hidden;max-width:100%;overscroll-behavior-x:contain;scrollbar-width:auto}
@@ -337,8 +337,8 @@ svg .nonresident-point.unsized{fill:#fff;stroke-dasharray:2 1}
 svg .nonresident-point:hover,svg .nonresident-point:focus,svg .nonresident-point.selected,svg .nonresident-point.related{stroke:#121f32;stroke-width:2.5}
 svg .op-tick.associated,svg .op-tick.selected{stroke:#151d32;stroke-width:3}
 svg [tabindex]:focus-visible{outline:2px solid #172739;outline-offset:1px}
-#details-panel{display:flex;flex-direction:column;min-height:0;align-self:stretch}
-#details-panel>.details{flex:1;min-height:0;max-height:none;overflow:auto}
+#details-panel{display:flex;flex-direction:column;min-height:0;box-sizing:border-box;overflow:hidden}
+#details-panel>.details{flex:1;min-height:0;overflow-y:auto}
 .chart-stack:focus-visible{outline:2px solid #14548e;outline-offset:2px}
 .details{overflow-wrap:anywhere;min-height:0;overflow:auto}
 .field{margin:.35rem 0}.field strong{display:inline-block;margin-right:.4rem}
@@ -358,7 +358,7 @@ operation tick, or table entry for details. Tab to focus rectangles and ticks.</
 <div class="controls"><label><input type="checkbox" id="show-synthetic" checked>
 Show selected LX relayout copies <span id="synthetic-count"></span></label></div>
 <p id="rejected-count" class="muted">__REJECTED_COUNT__ rejected relayout candidates omitted from buffer plots. <span id="no-consumer-count">__NO_CONSUMER_COUNT__ known no-consumer graph outputs omitted from nonresident plot/table (raw entries retained).</span></p>
-<div class="split"><section class="panel"><h2>Resident LX addresses by allocator tick</h2>
+<div class="split"><section id="plots-panel" class="panel"><h2>Resident LX addresses by allocator tick</h2>
 <div class="controls" aria-label="Horizontal scale">
 <button type="button" id="zoom-fit">Fit full graph</button>
 <button type="button" id="zoom-out" aria-label="Zoom out horizontally">−</button>
@@ -910,6 +910,9 @@ $("show-synthetic").addEventListener("change", filterBuffers);
 $("search").addEventListener("input", filterBuffers);
 $("reason").addEventListener("change", filterBuffers);
 const chartStack = $("charts");
+const syncDetailsHeight = () => {
+  $("details-panel").style.height = `${$("plots-panel").offsetHeight}px`;
+};
 chartStack.addEventListener("pointerenter", () => chartStack.focus({preventScroll: true}));
 chartStack.addEventListener("pointerdown", () => chartStack.focus({preventScroll: true}));
 chartStack.addEventListener("pointermove", event => {
@@ -935,7 +938,10 @@ $("zoom-fit").addEventListener("click", () => setZoom(0, true));
 $("zoom-out").addEventListener("click", () => setZoom(Number(zoom.value) - 1));
 $("zoom-in").addEventListener("click", () => setZoom(Number(zoom.value) + 1));
 zoom.addEventListener("input", e => setZoom(e.target.value));
-window.addEventListener("resize", () => setZoom(zoom.value, Number(zoom.value) === 0));
+window.addEventListener("resize", () => {
+  setZoom(zoom.value, Number(zoom.value) === 0);
+  syncDetailsHeight();
+});
 $("details-panel").addEventListener("toggle", () => {
   const closed = !$("details-panel").open;
   $("details-panel").parentElement.classList.toggle("details-closed", closed);
@@ -952,6 +958,10 @@ drawMap();
 drawNonresidentMap();
 fillTable();
 filterBuffers();
+syncDetailsHeight();
+if (typeof ResizeObserver !== "undefined") {
+  new ResizeObserver(syncDetailsHeight).observe($("plots-panel"));
+}
 </script></body></html>
 """
     preview_lx, preview_nonresident, preview_rows = _static_preview(record)

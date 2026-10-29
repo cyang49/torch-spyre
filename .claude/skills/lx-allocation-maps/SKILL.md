@@ -282,8 +282,9 @@ The searchable/filterable companion table is sorted lexicographically by its
 operation-links text (then by buffer name) and has a bounded-height region
 with independent vertical scrolling and sticky column headers. The details panel
 can be collapsed entirely to free the column; a compact `Show selected details`
-button reopens it. When open, it fills the plots row and long selections scroll
-inside it. Detail fields with unknown or null values are hidden.
+button reopens it. When open, it is capped at the plot panel's height; long
+selections scroll vertically inside the details text without stretching the plots
+row. Detail fields with unknown or null values are hidden.
 Generated HTML has pre-rendered charts, log-size y-labels, numeric x-axes
 and table rows even when local JavaScript is disabled; hover/focus tooltips,
 zoom and filtering require JavaScript.
