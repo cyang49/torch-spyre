@@ -185,6 +185,13 @@ Invalid records produce an error and nonzero exit; fix or explain them before
 plotting or reporting. `plot.py --record N` selects a capture record by its
 zero-based line order in the JSONL.
 
+Select the largest recorded watermark from the parsed summary rather than
+guessing from the order in the command's output:
+
+```bash
+python -c 'import json,sys; rows=json.load(open(sys.argv[1]))["records"]; print(max(rows,key=lambda row:row["global_watermark_bytes"])["capture_record_index"])' "$RUN/parsed/summary.json"
+```
+
 ### 3. Plot every graph or select individual records
 
 Render every valid record:
@@ -194,11 +201,12 @@ python "$TOOLS/plot.py" "$RUN/capture/allocations.<pid>.jsonl" \
   --output-dir "$RUN/plots"
 ```
 
-Render one record with `--record N`; repeat the option to render a subset:
+Render one record with `--record N`; repeat the option in the **same invocation**
+to render a subset into one indexed output directory:
 
 ```bash
 python "$TOOLS/plot.py" "$RUN/capture/allocations.<pid>.jsonl" \
-  --output-dir "$RUN/plots" --record 7
+  --output-dir "$RUN/plots" --record 7 --record 12
 ```
 
 Plotting requires Matplotlib. If unavailable, install it to the absolute
@@ -212,8 +220,11 @@ PYTHONPATH="$RUN/plot-deps" python "$TOOLS/plot.py" \
 
 Each rendered graph produces an interactive offline HTML allocation map, PNG,
 HTML operation ledger, TSV operation ledger, and JSON graph summary.
-`plots/manifest.json` indexes all outputs. The plotter uses the parser's
-CP-SAT, watermark, timeline, and capacity validation before rendering. Blue
+`plots/manifest.json` indexes the records selected in that invocation; a later
+invocation using the same output directory replaces the manifest even though
+previously rendered files remain. Use one invocation for the full selection or
+separate output directories. The plotter uses the parser's CP-SAT, watermark,
+timeline, and capacity validation before rendering. Blue
 rectangles are ordinary LX-resident buffers; orange marks ordinary buffers
 reaching the highest LX address, while teal identifies synthetic relayout
 buffers (with an orange outline if at the highest address). The red line is
