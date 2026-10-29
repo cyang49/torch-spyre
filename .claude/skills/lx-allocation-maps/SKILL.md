@@ -8,9 +8,8 @@ description: "Capture CP-SAT LX buffer allocations for compiled Spyre graphs, va
 Capture static CP-SAT buffer placement records from any model compile, parse the
 JSONL into graph summaries, and generate per-graph allocation maps and operation
 ledgers. Capture, parse, and plot are standalone CLIs under
-`.claude/skills/lx-allocation-maps/`; users can run them directly without this
-skill or an agent. Only the final experiment Markdown interpretation is
-agent-authored.
+`tools/lx_planning/allocation_maps/`; users can run them directly without an
+agent. Only the final experiment Markdown interpretation is agent-authored.
 
 ## Important semantics
 
@@ -60,12 +59,12 @@ agent-authored.
 
 ## Manual CLI workflow
 
-Run from the torch-spyre checkout. Set `SKILL` to the checked-out script
+Run from the torch-spyre checkout. Set `TOOLS` to the checked-out tool
 directory, and choose an experiment directory under the repository. Preserve
 all outputs there; do not use `/tmp` for experiment data.
 
 ```bash
-SKILL="$PWD/.claude/skills/lx-allocation-maps"
+TOOLS="$PWD/tools/lx_planning/allocation_maps"
 RUN="$PWD/agentic-experiments/$(date -u +%Y%m%dT%H%M%SZ)-allocation-map"
 mkdir -p "$RUN"
 ```
@@ -76,7 +75,7 @@ The target command must actually compile the graphs of interest. For a Python
 script that runs a compiled model:
 
 ```bash
-python "$SKILL/capture.py" --output-dir "$RUN/capture" -- \
+python "$TOOLS/capture.py" --output-dir "$RUN/capture" -- \
   python path/to/run_model.py --your-model-args
 ```
 
@@ -94,12 +93,12 @@ the actual benchmark command. Example one-request capture:
 
 ```bash
 cd /path/to/spyre-inference
-SKILL=/path/to/torch-spyre/.claude/skills/lx-allocation-maps
+TOOLS=/path/to/torch-spyre/tools/lx_planning/allocation_maps
 RUN="$PWD/agentic-experiments/<new-timestamp>-allocation-map"
 mkdir -p "$RUN"
 export TORCHINDUCTOR_CACHE_DIR="$RUN/torchinductor-cache"
 env SPYRE_NUM_CPUS=8 \
-  uv run --no-sync python "$SKILL/capture.py" \
+  uv run --no-sync python "$TOOLS/capture.py" \
     --output-dir "$RUN/capture" -- \
     uv run --no-sync vllm bench latency \
       --model google/gemma-4-26B-A4B-it \
@@ -142,7 +141,7 @@ export TORCH_COMPILE_DEBUG_DIR="$RUN/torch_compile_debug"
 Pass the exact interpreter and module path expected by the model:
 
 ```bash
-python "$SKILL/capture.py" --output-dir "$RUN/capture" -- \
+python "$TOOLS/capture.py" --output-dir "$RUN/capture" -- \
   /path/to/python /path/to/run_model.py --your-model-args
 ```
 
@@ -169,7 +168,7 @@ do not report an empty capture as a valid zero-allocation result.
 ### 2. Parse and validate the raw records
 
 ```bash
-python "$SKILL/parse.py" "$RUN/capture/allocations.<pid>.jsonl" \
+python "$TOOLS/parse.py" "$RUN/capture/allocations.<pid>.jsonl" \
   --output-dir "$RUN/parsed"
 ```
 
@@ -191,14 +190,14 @@ zero-based line order in the JSONL.
 Render every valid record:
 
 ```bash
-python "$SKILL/plot.py" "$RUN/capture/allocations.<pid>.jsonl" \
+python "$TOOLS/plot.py" "$RUN/capture/allocations.<pid>.jsonl" \
   --output-dir "$RUN/plots"
 ```
 
 Render one record with `--record N`; repeat the option to render a subset:
 
 ```bash
-python "$SKILL/plot.py" "$RUN/capture/allocations.<pid>.jsonl" \
+python "$TOOLS/plot.py" "$RUN/capture/allocations.<pid>.jsonl" \
   --output-dir "$RUN/plots" --record 7
 ```
 
@@ -207,14 +206,14 @@ experiment-local directory and use that same absolute path for `PYTHONPATH`:
 
 ```bash
 uv pip install --target "$RUN/plot-deps" matplotlib
-PYTHONPATH="$RUN/plot-deps" python "$SKILL/plot.py" \
+PYTHONPATH="$RUN/plot-deps" python "$TOOLS/plot.py" \
   "$RUN/capture/allocations.<pid>.jsonl" --output-dir "$RUN/plots"
 ```
 
 Each rendered graph produces an interactive offline HTML allocation map, PNG,
 HTML operation ledger, TSV operation ledger, and JSON graph summary.
-`plots/manifest.json` indexes all outputs. The plotter rechecks CP-SAT solver
-identity and recorded watermark/capacity invariants before rendering. Blue
+`plots/manifest.json` indexes all outputs. The plotter uses the parser's
+CP-SAT, watermark, timeline, and capacity validation before rendering. Blue
 rectangles are ordinary LX-resident buffers; orange marks ordinary buffers
 reaching the highest LX address, while teal identifies synthetic relayout
 buffers (with an orange outline if at the highest address). The red line is

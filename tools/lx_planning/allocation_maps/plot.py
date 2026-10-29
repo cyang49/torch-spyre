@@ -23,7 +23,9 @@ import json
 import math
 from pathlib import Path
 
-SCHEMA = "spyre-lx-allocation-graph-trace-v2"
+from parse import _load_records, _validate_record
+
+
 PALETTE = (
     "#397db8",
     "#e58a32",
@@ -1439,13 +1441,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.dpi <= 0:
         parser.error("--dpi must be positive")
-    records = [
-        json.loads(line)
-        for line in args.capture.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    if not records:
-        raise SystemExit(f"No allocation records in {args.capture}")
+    records = _load_records(args.capture)
     selected = (
         list(range(len(records)))
         if args.record_indices is None
@@ -1459,78 +1455,16 @@ def main() -> None:
     manifest = []
     for index in selected:
         record = records[index]
-        if record.get("schema") != SCHEMA:
-            raise SystemExit(f"Record {index} has unexpected schema")
-        if record.get("solver") != "CpSatLayoutSolver":
-            raise SystemExit(f"Record {index} is not CP-SAT")
-        buffers = record.get("buffers") or []
-        resident = [
-            buffer for buffer in buffers if buffer.get("address_bytes") is not None
-        ]
-        capacity = record.get("capacity_bytes")
-        if not isinstance(capacity, int) or capacity < 0:
-            raise SystemExit(f"Record {index} has invalid capacity")
-        for buffer in resident:
-            address = buffer["address_bytes"]
-            size = buffer["reserved_size_bytes"]
-            if address < 0 or size < 0 or address + size > capacity:
-                raise SystemExit(
-                    f"Record {index} buffer {buffer['name']} exceeds capacity"
-                )
-        watermark = max(
-            (
-                buffer["address_bytes"] + buffer["reserved_size_bytes"]
-                for buffer in resident
-            ),
-            default=0,
-        )
-        operations = record.get("operations") or []
-        timeline = record.get("timeline") or []
-        if record.get("operation_count") != len(operations):
-            raise SystemExit(f"Record {index} operation count mismatch")
-        if len(timeline) != len(operations):
-            raise SystemExit(f"Record {index} timeline length mismatch")
-        if any(tick.get("op_index") != i for i, tick in enumerate(timeline)):
-            raise SystemExit(f"Record {index} timeline indices are not contiguous")
-        for tick in timeline:
-            tick_index = tick.get("allocation_tick", tick["op_index"])
-            active = [
-                buffer
-                for buffer in resident
-                if buffer["start_time"] <= tick_index < buffer["end_time"]
-            ]
-            tick_watermark = max(
-                (
-                    buffer["address_bytes"] + buffer["reserved_size_bytes"]
-                    for buffer in active
-                ),
-                default=0,
-            )
-            if tick.get("watermark_bytes") != tick_watermark:
-                raise SystemExit(
-                    f"Record {index} operation {tick_index} watermark mismatch"
-                )
-            if tick.get("active_resident_buffers") != [
-                buffer["name"] for buffer in active
-            ]:
-                raise SystemExit(
-                    f"Record {index} operation {tick_index} active buffer mismatch"
-                )
-        operation_watermark = max(
-            (tick.get("watermark_bytes", 0) for tick in timeline), default=0
-        )
-        if operation_watermark > watermark:
-            raise SystemExit(f"Record {index} operation watermark exceeds global")
-        if (
-            record.get("max_operation_watermark_bytes", operation_watermark)
-            != operation_watermark
-        ):
-            raise SystemExit(f"Record {index} maximum operation watermark mismatch")
-        if watermark != record.get("global_watermark_bytes"):
-            raise SystemExit(f"Record {index} global watermark mismatch")
+        problems = _validate_record(record)
+        if problems:
+            raise SystemExit(f"Record {index} invalid: {'; '.join(problems)}")
         summary = _render_one(record, index, args.output_dir, args.dpi)
-        summary["timeline_matches_global_watermark"] = operation_watermark == watermark
-        summary["all_resident_spans_within_capacity"] = True
+        summary["timeline_matches_global_watermark"] = record[
+            "timeline_matches_global_watermark"
+        ]
+        summary["all_resident_spans_within_capacity"] = record[
+            "all_resident_spans_within_capacity"
+        ]
         manifest.append(summary)
         summary_path = args.output_dir / f"{summary['png'][:-4]}.json"
         summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

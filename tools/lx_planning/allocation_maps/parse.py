@@ -61,6 +61,8 @@ def _validate_record(record: dict) -> list[str]:
         problems.append("resident_count does not match addressed buffers")
 
     capacity = record.get("capacity_bytes")
+    if not isinstance(capacity, int) or capacity < 0:
+        problems.append("invalid capacity")
     watermark = max(
         (
             buffer["address_bytes"] + buffer["reserved_size_bytes"]
@@ -80,7 +82,11 @@ def _validate_record(record: dict) -> list[str]:
     for buffer in resident:
         start = buffer["address_bytes"]
         size = buffer["reserved_size_bytes"]
-        if start < 0 or size < 0 or start + size > capacity:
+        if (
+            start < 0
+            or size < 0
+            or (isinstance(capacity, int) and start + size > capacity)
+        ):
             problems.append(f"resident buffer {buffer['name']} exceeds capacity")
             break
     timeline = record.get("timeline") or []
