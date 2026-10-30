@@ -49,9 +49,41 @@ from torch._functorch._aot_autograd.logging_utils import (
 
 from torch_spyre._inductor.pass_utils import op_read_writes, op_short_name
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
 _FRAME_RE = regex.compile(r'File "([^"]+)", line (\d+)')
 _ORIGINAL_POST_SOLVE = allocator_module.CoOptimizingAllocator._post_solve
+_ORIGINAL_SOLVE = allocator_module.CoOptimizingAllocator._solve
+_ORIGINAL_EXTRACT = CpSatLayoutSolver._extract
+
+
+def _capture_extract(self, solver, bufs):
+    result = _ORIGINAL_EXTRACT(self, solver, bufs)
+    # The model places boxes in slots (2*i is operation i's write, 2*i+1
+    # its optional copy), not in the original buffer's operation indices.
+    self._capture_slot_spans = {
+        name: tuple(
+            bound if isinstance(bound, int) else solver.Value(bound)
+            for bound in sb.slot_span
+        )
+        for name, sb in bufs.items()
+        if sb.slot_span is not None
+    }
+    return result
+
+
+def _capture_solve(self, solver, graph):
+    allocation = _ORIGINAL_SOLVE(self, solver, graph)
+    self._capture_slot_spans = (
+        getattr(solver, "_capture_slot_spans", {} if not allocation else None)
+        if isinstance(solver, CpSatLayoutSolver)
+        else None
+    )
+    return allocation
+
+
+CpSatLayoutSolver._extract = _capture_extract
+allocator_module.CoOptimizingAllocator._solve = _capture_solve
 
 
 def _node_record(node: torch.fx.Node) -> dict:
@@ -125,7 +157,7 @@ def _origins(graph, operation) -> list[dict]:
 def _optional_value(obj, attribute):
     try:
         return getattr(obj, attribute, None)
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional compiler metadata is best effort
         # Capture must not turn a missing/deferred compiler layout into a failure.
         return None
 
@@ -144,7 +176,7 @@ def _dimensions(values):
             else:
                 result.append(str(value))
         return result
-    except Exception:
+    except Exception:  # noqa: BLE001 - symbolic dimensions may not resolve
         return None
 
 
@@ -169,7 +201,7 @@ def _spyre_layout(layout):
             if valid is not None
             else None
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional layout metadata is best effort
         valid_elements = None
     dtype = _optional_value(layout, "device_dtype")
     arrangement = _optional_value(layout, "element_arrangement")
@@ -194,7 +226,7 @@ def _lx_view(view):
             ],
             "num_cores": view.num_cores,
         }
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional LX view is best effort
         return None
 
 
@@ -202,7 +234,7 @@ def _tensor_metadata(graph, name):
     try:
         tensor = graph.try_get_buffer(name)
         layout = tensor.get_layout() if tensor is not None else None
-    except Exception:
+    except Exception:  # noqa: BLE001 - absent/deferred layout is allowed
         layout = None
     shape = _dimensions(_optional_value(layout, "size"))
     strides = _dimensions(_optional_value(layout, "stride"))
@@ -234,7 +266,7 @@ def _tensor_metadata(graph, name):
             and dtype is not None
             else None
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - logical footprint can be symbolic
         logical_bytes = None
     return {
         "host_shape": shape,
@@ -258,7 +290,7 @@ def _graph_edges(graph):
             for dep in op_read_writes(op).reads:
                 if dep.name is not None:
                     consumers.setdefault(dep.name, set()).add(index)
-        except Exception:
+        except Exception:  # noqa: BLE001 - partial graphs have unknown readers
             # A partial read graph cannot prove a buffer has no consumers.
             readable = False
     return producers, consumers, readable
@@ -296,14 +328,11 @@ def _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts):
     plans_by_destination = {
         plan.destination_name: plan for plan in accepted_lx_relayouts
     }
-    # Fixed-division allocation inserts synthetic destinations and transforms
-    # graph operation i to tick 2*i+1, leaving transfer ticks at 2*i. Joint
-    # solver relayout-copy buffers keep untransformed op indices.
-    half_ticks = any(
-        buffer.name.startswith("__spyre_lx_relayout__:")
-        and not buffer.name.startswith("__spyre_lx_relayout__:copy:")
-        for buffer in allocation
-    )
+    # CP-SAT boxes use solver slots: operation i writes at 2*i and a cut's
+    # optional copy executes at 2*i+1. These are not buffer.uses indices.
+    spans = allocator._capture_slot_spans
+    if spans is None or set(spans) != {buffer.name for buffer in allocation}:
+        raise ValueError("CP-SAT solved slot spans unavailable for capture")
 
     buffers = []
     resident = []
@@ -349,8 +378,6 @@ def _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts):
                 sorted({producers[name] for name in plan.consumer_names})
                 if plan is not None
                 and all(name in producers for name in plan.consumer_names)
-                else sorted({tick // 2 for tick in buffer.uses if tick % 2})
-                if half_ticks and not candidates
                 else None
             )
             producer_index = None  # Shuffle is at a transfer tick, not a graph op.
@@ -385,9 +412,9 @@ def _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts):
             "logical_size_bytes": buffer.size,
             "allocated_size_bytes": buffer.size,
             "reserved_size_bytes": reserved_size,
-            "start_time": buffer.start_time,
-            "end_time": buffer.end_time,
-            "uses": list(buffer.uses),
+            "start_time": spans[buffer.name][0],
+            "end_time": spans[buffer.name][1],
+            "uses": [2 * tick for tick in buffer.uses],
             "address_bytes": buffer.address,
             "chosen_division": division,
             "chosen_division_label": (
@@ -421,7 +448,7 @@ def _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts):
 
     timeline = []
     for operation in operations:
-        index = 2 * operation["op_index"] + 1 if half_ticks else operation["op_index"]
+        index = 2 * operation["op_index"]
         active = [
             buffer
             for buffer in resident
@@ -462,7 +489,7 @@ def _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts):
     record = {
         "schema": "spyre-lx-allocation-graph-trace-v2",
         "metadata_capture_phase": "planner_pre_commit",
-        "allocation_time_unit": "half_operation" if half_ticks else "operation",
+        "allocation_time_unit": "solver_slot",
         "pid": os.getpid(),
         "timestamp_unix": time.time(),
         "aot_graph_name": aot_graph_name,
@@ -503,13 +530,12 @@ def _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts):
     with _LOCK, path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, default=str) + "\n")
         stream.flush()
-    return None
 
 
 def _capture_post_solve(allocator, graph, allocation, accepted_lx_relayouts):
     try:
         _capture_pre_commit(allocator, graph, allocation, accepted_lx_relayouts)
-    except Exception:
+    except Exception:  # noqa: BLE001 - log capture errors; never break compilation
         # Inspection is best effort, but an omitted record must be visible.
         with _LOCK, _STATUS_PATH.open("a", encoding="utf-8") as stream:
             stream.write(

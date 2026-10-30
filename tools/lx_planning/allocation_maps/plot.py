@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Render PNG/HTML LX maps and operation ledgers per captured graph."""
+"""Render interactive LX maps and operation ledgers per captured graph."""
 
 from __future__ import annotations
 
@@ -23,19 +23,8 @@ import json
 import math
 from pathlib import Path
 
+import regex
 from parse import _load_records, _validate_record
-
-
-PALETTE = (
-    "#397db8",
-    "#e58a32",
-    "#45a78a",
-    "#8b65b7",
-    "#bd5b83",
-    "#987b38",
-    "#168c9a",
-    "#c56f33",
-)
 
 
 def _reason_fields(buffer: dict) -> list[tuple[str, str]]:
@@ -162,12 +151,18 @@ def _static_preview(record: dict) -> tuple[str, str, str]:
         for entry in ticks
         if isinstance(entry.get("op_index"), int)
     }
-    half_operation = record.get("allocation_time_unit") == "half_operation"
+    time_unit = record.get("allocation_time_unit")
 
     def operation_tick(index: int) -> int:
         if index in timeline_ticks:
             return timeline_ticks[index]
-        return 2 * index + 1 if half_operation else index
+        return (
+            2 * index + 1
+            if time_unit == "half_operation"
+            else 2 * index
+            if time_unit == "solver_slot"
+            else index
+        )
 
     y_labels = "".join(
         f'<line x1="75" x2="1175" y1="{22 + (high - power) * 210 / spread:.2f}" '
@@ -360,7 +355,7 @@ operation tick, or table entry for details. Tab to focus rectangles and ticks.</
 <div class="controls"><label><input type="checkbox" id="show-synthetic" checked>
 Show selected LX relayout copies <span id="synthetic-count"></span></label></div>
 <p id="rejected-count" class="muted">__REJECTED_COUNT__ rejected relayout candidates omitted from buffer plots. <span id="no-consumer-count">__NO_CONSUMER_COUNT__ known no-consumer graph outputs omitted from nonresident plot/table (raw entries retained).</span></p>
-<div class="split"><section id="plots-panel" class="panel"><h2>Resident LX addresses by allocator tick</h2>
+<div class="split"><section id="plots-panel" class="panel"><h2>Resident LX addresses by allocator tick / solver slot</h2>
 <div class="controls" aria-label="Horizontal scale">
 <button type="button" id="zoom-fit">Fit full graph</button>
 <button type="button" id="zoom-out" aria-label="Zoom out horizontally">−</button>
@@ -379,7 +374,7 @@ Show selected LX relayout copies <span id="synthetic-count"></span></label></div
 <details><summary>Operation strip color key</summary><div id="op-legend" class="legend"></div></details>
 <div class="chart-stack" id="charts" tabindex="0" role="region" aria-label="Allocation plots shown full height. Move pointer horizontally to set zoom focus; W/S zoom, A/D pan"><div class="map-scroll"><svg id="map" width="1201" height="557" viewBox="0 0 1201 557" aria-label="LX allocation address and operation timeline">__LX_PREVIEW__</svg></div>
 <h2>Nonresident graph-buffer size and lifetime</h2>
-<p class="muted">Up-arrows mark producer operations and down-arrows mark consumers when operation metadata exists; otherwise, small dots mark recorded use ticks. The larger hollow dot marks lifetime start, and the thin line spans the half-open lifetime. Y shows log₂ solver footprint bytes. W/S zoom around pointer; A/D pans horizontally.</p>
+<p class="muted">Up-arrows mark producer operations and down-arrows mark consumers when operation metadata exists; otherwise, small dots mark recorded use ticks. The larger hollow dot marks lifetime start, and the thin line spans the half-open lifetime. For solver-slot captures, operation i is at 2i and its optional copy at 2i+1. Y shows log₂ solver footprint bytes. W/S zoom around pointer; A/D pans horizontally.</p>
 <div class="legend" aria-label="Nonresident plot legend"><span><i class="swatch unsized" aria-hidden="true"></i>Lifetime start</span><span><i class="swatch use" aria-hidden="true"></i>Recorded use tick (without operation metadata)</span><span>↑ Producer operation</span><span>↓ Consumer operation</span></div>
 <div class="map-scroll"><svg id="nonresident-map" width="1201" height="307" viewBox="0 0 1201 307" aria-label="Nonresident buffer solver footprint and lifetime with producer, consumer, and reference markers">__NONRESIDENT_PREVIEW__</svg></div></div>
 <p id="resident-count" class="muted"></p></section>
@@ -394,7 +389,7 @@ Show selected LX relayout copies <span id="synthetic-count"></span></label></div
 <th>Spyre device layout</th><th>Solver footprint</th><th>Operation links</th></tr></thead>
 <tbody id="nonresident-rows">__ROWS_PREVIEW__</tbody></table></div></section>
 <div id="tooltip" role="tooltip" hidden></div>
-<noscript>Enable JavaScript to inspect this standalone capture. The PNG and operation ledger remain available.</noscript>
+<noscript>Enable JavaScript to inspect this standalone capture. The static preview and operation ledger remain available.</noscript>
 <script id="capture-data" type="application/json">__CAPTURE_DATA__</script>
 <script>
 "use strict";
@@ -411,18 +406,19 @@ const buffers = capturedBuffers.filter(b =>
 const resident = buffers.filter(b => b.address_bytes !== null && b.address_bytes !== undefined);
 const synthetic = b => b.is_synthetic_relayout === true || String(b.name || "").startsWith("__spyre_lx_relayout__");
 const nonresident = buffers.filter(b => b.address_bytes == null);
-// The allocator inserts transfer ticks before operation ticks when relayouts exist.
-// Old captures without a time unit only imply doubled ticks if uses exceed
-// the graph's operation range; a synthetic name alone is not proof.
-const doubled = data.allocation_time_unit === "half_operation" ||
-  (data.allocation_time_unit == null &&
-    buffers.some(b => (b.uses || []).some(t => t >= operations.length)));
-const opTick = i => timeline[i]?.allocation_tick ?? (doubled ? 2 * i + 1 : i);
+// Solver slots: op i writes at 2*i; a coarse-tiling copy uses 2*i+1.
+// Older fixed-division relayout captures put operation i at 2*i+1.
+const unit = data.allocation_time_unit;
+const doubled = unit === "solver_slot" || unit === "half_operation" ||
+  (unit == null && buffers.some(b => (b.uses || []).some(t => t >= operations.length)));
+const opTick = i => timeline[i]?.allocation_tick ?? (doubled ? 2 * i + (unit === "solver_slot" ? 0 : 1) : i);
 const tickOp = t => {
   const i = doubled ? Math.floor(t / 2) : t;
   return Number.isInteger(i) && i >= 0 && i < operations.length ? i : null;
 };
-const tickLabel = t => doubled && t % 2 === 0
+const tickLabel = t => unit === "solver_slot" && t % 2 === 1
+  ? `copy after operation ${(t - 1) / 2} (slot ${t})`
+  : doubled && unit !== "solver_slot" && t % 2 === 0
   ? `transfer before operation ${t / 2} (tick ${t})` : `tick ${t}`;
 const maxTick = Math.max(operations.length ? opTick(operations.length - 1) + 1 : 0,
   buffers.reduce((max, b) => Math.max(max, Number(b.end_time) || 0), 0), 1);
@@ -706,7 +702,9 @@ function drawMap() {
     map.append(label);
   }
   const xlabel = svg("text", {x:left,y:height-8,class:"axis-label"});
-  xlabel.textContent = `Allocator tick (operation ${doubled ? "2i+1; preceding transfer 2i" : "i"})`;
+  xlabel.textContent = unit === "solver_slot"
+    ? "Solver slot (operation i at 2i; optional copy at 2i+1)"
+    : `Allocator tick (operation ${doubled ? "2i+1; preceding transfer 2i" : "i"})`;
   map.append(xlabel);
 }
 function drawNonresidentMap() {
@@ -994,353 +992,25 @@ if (typeof ResizeObserver !== "undefined") {
     )
 
 
-def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch, Rectangle
-    from matplotlib.ticker import FuncFormatter
+def _safe_graph_name(name: object, index: int) -> str:
+    """Make graph identity a single bounded filename component, not a path."""
+    safe = (
+        regex.sub(r"[^A-Za-z0-9_-]+", "_", name[:100]).strip("_")
+        if isinstance(name, str)
+        else ""
+    )
+    return safe or f"graph-{index}"
 
+
+def _render_one(record: dict, index: int, output_dir: Path) -> dict:
     operations = record["operations"]
     timeline = record["timeline"]
-    resident = [
-        buffer
-        for buffer in record["buffers"]
-        if buffer.get("address_bytes") is not None
-    ]
-    count = len(operations)
     capacity = record["capacity_bytes"]
     watermark = record["global_watermark_bytes"]
-    max_tick = max(
-        max((buffer["end_time"] for buffer in record["buffers"]), default=0),
-        max(
-            (tick.get("allocation_tick", tick["op_index"]) + 1 for tick in timeline),
-            default=0,
-        ),
-    )
-    peak_buffers = {
-        buffer["name"]
-        for buffer in resident
-        if buffer["address_bytes"] + buffer["reserved_size_bytes"] == watermark
-        and watermark
-    }
+    stem = f"{_safe_graph_name(record.get('aot_graph_name'), index)}-solve-{index}"
 
-    figure, (allocation_ax, nonresident_ax, op_ax) = plt.subplots(
-        3,
-        1,
-        figsize=(18, 11),
-        sharex=True,
-        gridspec_kw={"height_ratios": (4, 1.5, 0.7)},
-        layout="constrained",
-    )
-    figure.suptitle(
-        f"{record.get('aot_graph_name') or 'unnamed graph'} — CP-SAT LX allocation\n"
-        f"{count} operations · {record['resident_count']} resident buffers · "
-        f"watermark {watermark:,} B / capacity {capacity:,} B "
-        f"({watermark / max(capacity, 1):.1%}) · "
-        f"Inductor graph ID {record.get('inductor_graph_id')}"
-    )
-    for buffer in resident:
-        start, end = buffer["start_time"], buffer["end_time"]
-        address, extent = buffer["address_bytes"], buffer["reserved_size_bytes"]
-        is_peak = buffer["name"] in peak_buffers
-        allocation_ax.add_patch(
-            Rectangle(
-                (start, address),
-                end - start,
-                extent,
-                facecolor="#a64d77"
-                if buffer["name"].startswith("while_loop_")
-                else PALETTE[6]
-                if buffer.get("is_synthetic_relayout")
-                else (PALETTE[1] if is_peak else PALETTE[0]),
-                edgecolor="#63314d"
-                if buffer["name"].startswith("while_loop_")
-                else "#9c4c17"
-                if is_peak
-                else ("#075c66" if buffer.get("is_synthetic_relayout") else "#24577f"),
-                alpha=0.9
-                if buffer["name"].startswith("while_loop_")
-                else 0.72
-                if is_peak or buffer.get("is_synthetic_relayout")
-                else 0.38,
-                linewidth=2
-                if buffer["name"].startswith("while_loop_")
-                or (is_peak and buffer.get("is_synthetic_relayout"))
-                else 0.7,
-            )
-        )
-        if buffer["name"].startswith("while_loop_"):
-            allocation_ax.add_line(
-                Line2D(
-                    [start, end],
-                    [address + extent / 2, address + extent / 2],
-                    color="#a64d77",
-                    linewidth=4,
-                    zorder=3,
-                )
-            )
-        if end - start >= 1.5 and extent >= 16384:
-            allocation_ax.text(
-                (start + end) / 2,
-                address + extent / 2,
-                buffer["name"],
-                ha="center",
-                va="center",
-                fontsize=5.5,
-                clip_on=True,
-            )
-    nonresident_buffers = [
-        buffer
-        for buffer in record["buffers"]
-        if buffer.get("address_bytes") is None
-        and not buffer.get("is_synthetic_relayout")
-        and not buffer["name"].startswith("__spyre_lx_relayout__")
-        and not (
-            isinstance(buffer.get("consumer_op_indices"), list)
-            and not buffer["consumer_op_indices"]
-        )
-    ]
-    allocation_ax.step(
-        [tick.get("allocation_tick", tick["op_index"]) for tick in timeline]
-        + [max_tick],
-        [tick["watermark_bytes"] for tick in timeline]
-        + ([timeline[-1]["watermark_bytes"]] if timeline else [0]),
-        where="post",
-        color="#c72d32",
-        linewidth=1.8,
-        label="Per-operation watermark",
-        zorder=5,
-    )
-    allocation_ax.axhline(
-        capacity, color="#666", linestyle="--", linewidth=1, label="Capacity"
-    )
-    allocation_ax.set(
-        xlim=(0, max(max_tick, 1)),
-        ylim=(0, max(capacity, 1)),
-        ylabel="LX address (KiB)",
-        title="Reserved address extents by allocator tick; half-open lifetimes [start, end)",
-    )
-    allocation_ax.yaxis.set_major_formatter(
-        FuncFormatter(lambda value, _: f"{value / 1024:.0f}")
-    )
-    allocation_ax.set_xticks(range(0, max_tick + 1, max(1, max_tick // 16)))
-    allocation_ax.set_xticks(range(max_tick + 1), minor=True)
-    allocation_ax.set_yticks(range(0, capacity + 1, 32768), minor=True)
-    allocation_ax.grid(True, axis="both", alpha=0.2)
-    allocation_ax.grid(True, which="minor", axis="both", alpha=0.06)
-    allocation_ax.legend(
-        handles=[
-            Patch(facecolor=PALETTE[0], alpha=0.38, label="Other LX-resident buffer"),
-            Patch(facecolor=PALETTE[6], alpha=0.72, label="Synthetic relayout buffer"),
-            Patch(
-                facecolor=PALETTE[1],
-                alpha=0.72,
-                label="Buffer reaching the highest LX address",
-            ),
-            Line2D([], [], color="#a64d77", linewidth=4, label="while_loop_ buffer"),
-            Line2D([], [], color="#666", linestyle="--", label="Planner LX capacity"),
-        ],
-        loc="upper left",
-        fontsize=8,
-    )
-    allocation_ax.text(
-        max(0.5, max_tick - 0.5),
-        watermark,
-        f"{watermark / 1024:.0f} KiB",
-        color="#c72d32",
-        va="bottom",
-        ha="right",
-        fontsize=8,
-    )
-
-    op_types = list(
-        dict.fromkeys(str(op.get("op_type") or "unknown") for op in operations)
-    )
-    type_colors = {
-        name: "#a64d77" if name == "while_loop" else PALETTE[position % len(PALETTE)]
-        for position, name in enumerate(op_types)
-    }
-    nonresident_buffers = [
-        buffer
-        for buffer in record["buffers"]
-        if buffer.get("address_bytes") is None
-        and not buffer.get("is_synthetic_relayout")
-        and not buffer["name"].startswith("__spyre_lx_relayout__")
-        and not (
-            isinstance(buffer.get("consumer_op_indices"), list)
-            and not buffer["consumer_op_indices"]
-        )
-    ]
-    footprint_sizes = [
-        buffer.get("allocated_size_bytes", buffer.get("logical_size_bytes"))
-        for buffer in nonresident_buffers
-    ]
-    valid_sizes = [
-        size for size in footprint_sizes if isinstance(size, (int, float)) and size > 0
-    ]
-    low = math.floor(math.log2(min(valid_sizes))) if valid_sizes else 0
-    high = math.ceil(math.log2(max(valid_sizes))) if valid_sizes else 0
-    span = max(high - low, 1)
-    for power in range(low, high + 1):
-        if valid_sizes and (
-            (power - low) % max(1, math.ceil(span / 6)) == 0 or power == high
-        ):
-            position = (high - power) / span
-            nonresident_ax.axhline(position, color="#dfe6ee", linewidth=0.7)
-            nonresident_ax.text(
-                -0.01,
-                position,
-                f"2^{power} B",
-                transform=nonresident_ax.transAxes,
-                ha="right",
-                va="center",
-                fontsize=7,
-            )
-    for buffer in nonresident_buffers:
-        size = buffer.get("allocated_size_bytes", buffer.get("logical_size_bytes"))
-        valid = isinstance(size, (int, float)) and size > 0
-        y = (high - math.log2(size)) / span if valid else -0.06
-        start, end = buffer["start_time"], buffer["end_time"]
-        loop_buffer = buffer["name"].startswith("while_loop_")
-        nonresident_ax.plot(
-            [start, end],
-            [y, y],
-            color="#a64d77" if loop_buffer else "#8162a6",
-            linewidth=2.5 if loop_buffer else 1.6,
-            alpha=0.85,
-        )
-        nonresident_ax.scatter(
-            [start],
-            [y],
-            facecolors="none",
-            edgecolors="#a64d77" if loop_buffer else "#46305f",
-            s=32,
-            linewidths=1.2,
-            zorder=4,
-        )
-        producer = buffer.get("producer_op_index")
-        if isinstance(producer, int) and 0 <= producer < len(timeline):
-            producer_tick = timeline[producer].get("allocation_tick", producer)
-            nonresident_ax.annotate(
-                "↑",
-                (producer_tick, y),
-                xytext=(0, 6),
-                textcoords="offset points",
-                ha="center",
-                color="#a64d77" if loop_buffer else "#14548e",
-                fontsize=9,
-            )
-        for consumer in buffer.get("consumer_op_indices") or []:
-            if isinstance(consumer, int) and 0 <= consumer < len(timeline):
-                consumer_tick = timeline[consumer].get("allocation_tick", consumer)
-                nonresident_ax.annotate(
-                    "↓",
-                    (consumer_tick, y),
-                    xytext=(0, -8),
-                    textcoords="offset points",
-                    ha="center",
-                    color="#a33b20",
-                    fontsize=9,
-                )
-        if loop_buffer:
-            nonresident_ax.text(
-                (start + end) / 2,
-                y,
-                buffer["name"],
-                ha="center",
-                va="center",
-                fontsize=6,
-                color="#63314d",
-                clip_on=True,
-            )
-    nonresident_ax.set(
-        xlim=(0, max(max_tick, 1)),
-        ylim=(-0.12, 1.08),
-        ylabel="Solver footprint",
-        title="Nonresident buffer lifetime by allocator tick",
-    )
-    nonresident_ax.set_yticks([])
-    nonresident_ax.set_xticks(range(0, max_tick + 1, max(1, max_tick // 16)))
-    nonresident_ax.grid(True, axis="x", alpha=0.15)
-    nonresident_ax.legend(
-        handles=[
-            Line2D(
-                [],
-                [],
-                color="#8162a6",
-                linewidth=1.6,
-                label="Nonresident buffer lifetime",
-            ),
-            Line2D([], [], color="#a64d77", linewidth=2.5, label="while_loop_ buffer"),
-            Line2D(
-                [],
-                [],
-                color="#14548e",
-                marker=r"$\uparrow$",
-                linestyle="None",
-                label="Producer operation",
-            ),
-            Line2D(
-                [],
-                [],
-                color="#a33b20",
-                marker=r"$\downarrow$",
-                linestyle="None",
-                label="Consumer operation",
-            ),
-        ],
-        loc="upper right",
-        fontsize=7,
-        ncols=2,
-    )
-    for operation in operations:
-        op_type = str(operation.get("op_type") or "unknown")
-        x = timeline[operation["op_index"]].get(
-            "allocation_tick", operation["op_index"]
-        )
-        op_ax.add_patch(
-            Rectangle(
-                (x, 0),
-                1,
-                1,
-                facecolor=type_colors[op_type],
-                edgecolor="white",
-                linewidth=0.4,
-            )
-        )
-        if count <= 160:
-            op_ax.text(
-                x + 0.5,
-                0.5,
-                str(x),
-                ha="center",
-                va="center",
-                fontsize=5.5,
-                color="white",
-            )
-    op_ax.set(
-        xlim=(0, max(max_tick, 1)),
-        ylim=(0, 1),
-        title="Operation type by allocator tick",
-    )
-    op_ax.set_xticks(range(0, max_tick + 1, max(1, max_tick // 16)))
-    op_ax.set_yticks([])
-    op_ax.grid(True, axis="x", alpha=0.12)
-    op_ax.set_xlabel("Allocator tick (operation indices are labeled on color blocks)")
-    op_ax.text(
-        0.01,
-        -0.5,
-        "Operation strip colors repeat by op type; numbers are graph op indices.",
-        transform=op_ax.transAxes,
-        fontsize=8,
-    )
-
-    stem = f"{record.get('aot_graph_name') or f'graph-{index}'}-solve-{index}"
     interactive_path = output_dir / f"{stem}-interactive.html"
     _render_interactive_html(record, interactive_path)
-    png_path = output_dir / f"{stem}.png"
-    figure.savefig(png_path, dpi=dpi)
-    plt.close(figure)
 
     ledger_path = output_dir / f"{stem}-ledger.html"
     tsv_path = output_dir / f"{stem}.tsv"
@@ -1419,7 +1089,7 @@ def _render_one(record: dict, index: int, output_dir: Path, dpi: int) -> dict:
         "global_watermark_bytes": watermark,
         "capacity_bytes": capacity,
         "watermark_fraction": watermark / capacity if capacity else None,
-        "png": png_path.name,
+        "summary": f"{stem}.json",
         "interactive_html": interactive_path.name,
         "html_ledger": ledger_path.name,
         "operation_ledger": tsv_path.name,
@@ -1430,7 +1100,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=Path, help="allocations.<pid>.jsonl")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--dpi", type=int, default=180)
+    # No raster rendering or DPI option: HTML remains self-contained and offline.
     parser.add_argument(
         "--record",
         type=int,
@@ -1439,8 +1109,6 @@ def main() -> None:
         help="Capture record index to render; repeat for several. Default: all records.",
     )
     args = parser.parse_args()
-    if args.dpi <= 0:
-        parser.error("--dpi must be positive")
     records = _load_records(args.capture)
     selected = (
         list(range(len(records)))
@@ -1458,7 +1126,7 @@ def main() -> None:
         problems = _validate_record(record)
         if problems:
             raise SystemExit(f"Record {index} invalid: {'; '.join(problems)}")
-        summary = _render_one(record, index, args.output_dir, args.dpi)
+        summary = _render_one(record, index, args.output_dir)
         summary["timeline_matches_global_watermark"] = record[
             "timeline_matches_global_watermark"
         ]
@@ -1466,7 +1134,7 @@ def main() -> None:
             "all_resident_spans_within_capacity"
         ]
         manifest.append(summary)
-        summary_path = args.output_dir / f"{summary['png'][:-4]}.json"
+        summary_path = args.output_dir / summary["summary"]
         summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(summary, sort_keys=True), flush=True)
     manifest_path = args.output_dir / "manifest.json"

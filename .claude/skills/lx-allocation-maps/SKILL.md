@@ -21,17 +21,17 @@ agent. Only the final experiment Markdown interpretation is agent-authored.
   do not show emitted bundle instruction order, runtime occupancy, HBM traffic,
   or a model-wide peak across graphs.
 - The plotted watermark is the highest resident buffer end address at an
-  allocator tick, not the sum of resident buffer sizes. In ordinary solves,
-  allocator tick `i` is graph operation index `i`; the fixed-division relayout
-  planner can instead place operation `i` at `2*i+1` with a transfer at `2*i`.
-  Read `allocation_time_unit` and `timeline[].allocation_tick` rather than
-  interpreting every tick as an operation. `uses` has at most one entry per
-  graph op that accesses the buffer; for a computed buffer its first access is
-  the producing write. The lifetime-start marker may therefore coincide with
-  a write, not a read. A plot dot is one recorded access tick, not each load
-  instruction or repeated read within an operation.
-  Keep half-open intervals `[start_time, end_time)` and do not impose a
-  universal two-operation minimum.
+  allocator tick, not the sum of resident buffer sizes. New CP-SAT captures
+  use `solver_slot` time: graph operation `i` writes in slot `2*i`, and a
+  coarse-tiling cut's optional copy runs at `2*i+1`. The plotted half-open
+  lifetime `[start_time, end_time)` is the solver-selected placement box; it
+  may differ from the buffer's original operation-index lifetime when coarse
+  tiling changes the schedule. `uses` records graph access at `2*i`, not copy
+  instructions. Older captures used operation index `i`; fixed-division
+  relayout captures can use operation `2*i+1` with a transfer at `2*i`.
+  Always read `allocation_time_unit` and `timeline[].allocation_tick`.
+  The first use of a computed buffer is its producing write, not necessarily
+  a read. A plot dot is one recorded access, not every emitted load.
 - Capture distinguishes host tensor shape, dtype, and strides from physical
   `SpyreTensorLayout` where available: `device_size`, `stride_map`,
   `device_dtype`, `element_arrangement`, and `valid_elements`. Unknown/symbolic
@@ -44,9 +44,9 @@ agent. Only the final experiment Markdown interpretation is agent-authored.
   assigned.
 - `capacity_bytes` is the frontend allocator's available range for that compile
   configuration, not necessarily the physical 2 MiB LX size.
-- These scripts instrument `CoOptimizingAllocator._post_solve`. They capture
-  the joint-placement allocator used by normal CP-SAT co-optimization. They do
-  not promise records from placement-only `ScratchpadAllocator` solvers.
+- These scripts instrument the CP-SAT solve's slot-span extraction and
+  `CoOptimizingAllocator._post_solve`. They capture the joint-placement
+  allocator, not placement-only `ScratchpadAllocator` solves.
 - The hook gathers FX source metadata and writes JSON during compilation. That
   adds compile-time and disk overhead; **never include hook-enabled timings in a
   latency comparison**. For timing, use a separate hook-free run with matching
@@ -178,7 +178,8 @@ allocator ticks. A transfer-only tick can set a global peak above the maximum
 sampled at graph operations. A valid run exits zero and writes:
 
 - `parsed/summary.json`: one row per captured graph with operation/source
-  coverage, resident/spilled counts, watermark, capacity and fraction;
+  coverage, resident/nonresident counts (nonresident does not imply HBM
+  placement), watermark, capacity and fraction;
 - `parsed/graphs.tsv`: compact spreadsheet-friendly view.
 
 Invalid records produce an error and nonzero exit; fix or explain them before
@@ -209,17 +210,10 @@ python "$TOOLS/plot.py" "$RUN/capture/allocations.<pid>.jsonl" \
   --output-dir "$RUN/plots" --record 7 --record 12
 ```
 
-Plotting requires Matplotlib. If unavailable, install it to the absolute
-experiment-local directory and use that same absolute path for `PYTHONPATH`:
-
-```bash
-uv pip install --target "$RUN/plot-deps" matplotlib
-PYTHONPATH="$RUN/plot-deps" python "$TOOLS/plot.py" \
-  "$RUN/capture/allocations.<pid>.jsonl" --output-dir "$RUN/plots"
-```
-
-Each rendered graph produces an interactive offline HTML allocation map, PNG,
-HTML operation ledger, TSV operation ledger, and JSON graph summary.
+The plotter uses only Python's standard library plus the project's `regex`
+dependency; it does not require Matplotlib. Each rendered graph produces an
+interactive offline HTML allocation map, HTML operation ledger, TSV operation
+ledger, and JSON graph summary.
 `plots/manifest.json` indexes the records selected in that invocation; a later
 invocation using the same output directory replaces the manifest even though
 previously rendered files remain. Use one invocation for the full selection or
@@ -314,7 +308,8 @@ recording:
 - workload, shapes/dtypes, compile controls, device/runtime, repository
   revisions, commands, and number of capture runs;
 - captured graph inventory and operation/source coverage;
-- highest watermarks and capacities, with links to the specific PNG/ledger/TSV;
+- highest watermarks and capacities, with links to the interactive HTML, ledger,
+  and TSV;
 - CP-SAT and invariant validation status;
 - interpretation limits: static planner address extents, no inference of runtime
   LX occupancy, final instruction schedule, dynamic transactions, or aggregate

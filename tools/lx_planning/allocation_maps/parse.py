@@ -75,7 +75,7 @@ def _validate_record(record: dict) -> list[str]:
             "global_watermark_bytes does not match resident address extents"
         )
     time_unit = record.get("allocation_time_unit", "operation")
-    if time_unit not in ("operation", "half_operation"):
+    if time_unit not in ("operation", "half_operation", "solver_slot"):
         problems.append(f"invalid allocation time unit {time_unit!r}")
     if record.get("all_resident_spans_within_capacity") is not True:
         problems.append("all_resident_spans_within_capacity is false")
@@ -89,6 +89,16 @@ def _validate_record(record: dict) -> list[str]:
         ):
             problems.append(f"resident buffer {buffer['name']} exceeds capacity")
             break
+    if time_unit == "solver_slot":
+        for buffer in buffers:
+            if (
+                not isinstance(buffer.get("start_time"), int)
+                or not isinstance(buffer.get("end_time"), int)
+                or buffer["start_time"] < 0
+                or buffer["start_time"] > buffer["end_time"]
+            ):
+                problems.append(f"invalid solved span for {buffer.get('name')}")
+                break
     timeline = record.get("timeline") or []
     if len(timeline) != len(operations):
         problems.append("timeline length does not match operations")
@@ -97,7 +107,13 @@ def _validate_record(record: dict) -> list[str]:
             problems.append("timeline indices are not contiguous from zero")
             break
         allocation_tick = tick.get("allocation_tick", index)
-        expected_tick = 2 * index + 1 if time_unit == "half_operation" else index
+        expected_tick = (
+            2 * index + 1
+            if time_unit == "half_operation"
+            else 2 * index
+            if time_unit == "solver_slot"
+            else index
+        )
         if allocation_tick != expected_tick:
             problems.append(f"operation {index} allocation tick mismatch")
             break
@@ -165,7 +181,7 @@ def _summary(record: dict, index: int) -> dict:
         "operations_with_source_file": source_ops,
         "buffer_count": len(buffers),
         "resident_count": len(resident),
-        "spilled_count": len(buffers) - len(resident),
+        "nonresident_count": len(buffers) - len(resident),
         "global_watermark_bytes": watermark,
         "max_operation_watermark_bytes": record.get("max_operation_watermark_bytes"),
         "capacity_bytes": capacity,
